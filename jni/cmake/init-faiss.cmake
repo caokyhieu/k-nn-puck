@@ -89,8 +89,9 @@ endif()
 
 find_package(ZLIB REQUIRED)
 
-# Statically link BLAS - ensure this is before we find the blas package so we dont dynamically link
-set(BLA_STATIC ON)
+# Use shared BLAS libraries to avoid OpenMP static linking issues
+# Static libgomp.a causes relocation errors when building shared libraries
+set(BLA_STATIC OFF)
 find_package(BLAS REQUIRED)
 enable_language(Fortran)
 find_package(LAPACK REQUIRED)

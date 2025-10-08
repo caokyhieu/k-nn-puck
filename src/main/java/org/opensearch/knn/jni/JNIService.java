@@ -48,7 +48,10 @@ public class JNIService {
             }
 
             return FaissService.initIndex(numDocs, dim, parameters);
+        }
 
+        if (KNNEngine.PUCK == knnEngine) {
+            return PuckService.initIndex(numDocs, dim, parameters);
         }
 
         throw new IllegalArgumentException(
@@ -142,6 +145,11 @@ public class JNIService {
             return;
         }
 
+        if (KNNEngine.PUCK == knnEngine) {
+            PuckService.createIndex(ids, vectorsAddress, dim, output, parameters);
+            return;
+        }
+
         throw new IllegalArgumentException(
             String.format(Locale.ROOT, "CreateIndex not supported for provided engine : %s", knnEngine.getName())
         );
@@ -181,6 +189,11 @@ public class JNIService {
             return;
         }
 
+        if (KNNEngine.PUCK == knnEngine) {
+            PuckService.createIndexFromTemplate(ids, vectorsAddress, dim, output, templateIndex, parameters);
+            return;
+        }
+
         throw new IllegalArgumentException(
             String.format(Locale.ROOT, "CreateIndexFromTemplate not supported for provided engine : %s", knnEngine.getName())
         );
@@ -203,6 +216,8 @@ public class JNIService {
             }
         } else if (KNNEngine.NMSLIB == knnEngine) {
             return NmslibService.loadIndexWithStream(readStream, parameters);
+        } else if (KNNEngine.PUCK == knnEngine) {
+            return PuckService.loadIndexWithStream(readStream);
         }
 
         throw new IllegalArgumentException(
@@ -305,6 +320,11 @@ public class JNIService {
             }
             return FaissService.queryIndex(indexPointer, queryVector, k, methodParameters, parentIds);
         }
+
+        if (KNNEngine.PUCK == knnEngine) {
+            return PuckService.queryIndex(indexPointer, queryVector, k, methodParameters);
+        }
+
         throw new IllegalArgumentException(
             String.format(Locale.ROOT, "QueryIndex not supported for provided engine : %s", knnEngine.getName())
         );
@@ -413,6 +433,10 @@ public class JNIService {
                 return FaissService.trainByteIndex(indexParameters, dimension, trainVectorsPointer);
             }
             return FaissService.trainIndex(indexParameters, dimension, trainVectorsPointer);
+        }
+
+        if (KNNEngine.PUCK == knnEngine) {
+            return PuckService.trainIndex(indexParameters, dimension, trainVectorsPointer);
         }
 
         throw new IllegalArgumentException(

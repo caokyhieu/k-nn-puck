@@ -4,3 +4,6 @@
 [submodule "jni/external/faiss"]
 	path = jni/external/faiss
 	url = https://github.com/facebookresearch/faiss.git
+[submodule "jni/external/puck"]
+	path = jni/external/puck
+	url = https://github.com/baidu/puck.git

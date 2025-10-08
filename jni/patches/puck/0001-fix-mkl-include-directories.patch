@@ -1,0 +1,27 @@
+diff --git a/cmake/FindMKL.cmake b/cmake/FindMKL.cmake
+index 107ee19..0d2090d 100644
+--- a/cmake/FindMKL.cmake
++++ b/cmake/FindMKL.cmake
+@@ -365,4 +365,5 @@ set(CMAKE_FIND_LIBRARY_SUFFIXES ${_blas_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES})
+ find_path(MKL_H mkl.h
+   HINTS ${MKLROOT}
+   PATH_SUFFIXES include)
+-INCLUDE_DIRECTORIES(${MKL_H})
+\ No newline at end of file
++# INCLUDE_DIRECTORIES(${MKL_H})  # Commented out to avoid applying globally
++# MKL include directories are added per-target in parent CMakeLists.txt
+\ No newline at end of file
+diff --git a/puck/CMakeLists.txt b/puck/CMakeLists.txt
+index e18e0ad..8cb71e6 100644
+--- a/puck/CMakeLists.txt
++++ b/puck/CMakeLists.txt
+@@ -23,7 +23,8 @@ file(
+ add_library(puck ${PUCK_CPP_FILES})
+ 
+ target_include_directories(puck PUBLIC
+-$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
++$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
++${MKL_H})
+ 
+ set_target_properties(puck PROPERTIES
+ POSITION_INDEPENDENT_CODE ON

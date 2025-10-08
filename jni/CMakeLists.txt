@@ -16,15 +16,17 @@ set(TARGET_LIB_UTIL opensearchknn_util)
 set(TARGET_LIB_COMMON opensearchknn_common)  # common lib for JNI
 set(TARGET_LIB_NMSLIB opensearchknn_nmslib)  # nmslib JNI
 set(TARGET_LIB_FAISS opensearchknn_faiss)    # faiss JNI
+set(TARGET_LIB_PUCK opensearchknn_puck)      # puck JNI
 set(TARGET_LIBS "")  # Libs to be installed
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 option(CONFIG_FAISS "Configure faiss library build when this is on")
 option(CONFIG_NMSLIB "Configure nmslib library build when this is on")
+option(CONFIG_PUCK "Configure puck library build when this is on")
 option(CONFIG_TEST "Configure tests when this is on")
 
-if (${CONFIG_FAISS} STREQUAL OFF AND ${CONFIG_NMSLIB} STREQUAL OFF AND ${CONFIG_TEST} STREQUAL OFF)
+if (${CONFIG_FAISS} STREQUAL OFF AND ${CONFIG_NMSLIB} STREQUAL OFF AND ${CONFIG_PUCK} STREQUAL OFF AND ${CONFIG_TEST} STREQUAL OFF)
     set(CONFIG_ALL ON)
 else()
     set(CONFIG_ALL OFF)
@@ -50,6 +52,10 @@ if (${CMAKE_SYSTEM_NAME} STREQUAL Darwin)
 elseif(${CMAKE_SYSTEM_NAME} STREQUAL Linux)
     set(JVM_OS_TYPE linux)
     set(LIB_EXT .so)
+    # Set RPATH to $ORIGIN so libraries can find each other in the same directory
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
+    set(CMAKE_BUILD_RPATH "$ORIGIN")
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 elseif(${CMAKE_SYSTEM_NAME} STREQUAL Windows)
 # Set the CXX_COMPILER_VERSION, CMAKE_CXX_FLAGS, JVM_OS_TYPE, prefix and extension for the target libraries that are built.
     set(CXX_COMPILER_VERSION ${CMAKE_CXX_COMPILER_VERSION})
@@ -104,8 +110,14 @@ endif ()
 
 # ---------------------------------- FAISS ----------------------------------
 if (${CONFIG_FAISS} STREQUAL ON OR ${CONFIG_ALL} STREQUAL ON OR ${CONFIG_TEST} STREQUAL ON)
+    # Force use of shared libraries for BLAS/LAPACK to avoid OpenMP static linking issues
+    set(BLA_STATIC OFF)
+
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/init-faiss.cmake)
     find_package(OpenMP REQUIRED)
+
+    # Force use of shared OpenMP library instead of static to avoid relocation errors
+    set(OpenMP_CXX_FLAGS "${OpenMP_CXX_FLAGS} -fopenmp")
     add_library(
         ${TARGET_LIB_FAISS} SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_FaissService.cpp
@@ -114,7 +126,8 @@ if (${CONFIG_FAISS} STREQUAL ON OR ${CONFIG_ALL} STREQUAL ON OR ${CONFIG_TEST} S
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_index_service.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_methods.cpp
     )
-    target_link_libraries(${TARGET_LIB_FAISS} ${TARGET_LINK_FAISS_LIB} ${TARGET_LIB_UTIL} OpenMP::OpenMP_CXX)
+    # Explicitly link shared gomp library to prevent static linking
+    target_link_libraries(${TARGET_LIB_FAISS} ${TARGET_LINK_FAISS_LIB} ${TARGET_LIB_UTIL} OpenMP::OpenMP_CXX -lgomp)
     target_include_directories(${TARGET_LIB_FAISS} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         $ENV{JAVA_HOME}/include
@@ -123,6 +136,58 @@ if (${CONFIG_FAISS} STREQUAL ON OR ${CONFIG_ALL} STREQUAL ON OR ${CONFIG_TEST} S
     )
     opensearch_set_common_properties(${TARGET_LIB_FAISS})
     list(APPEND TARGET_LIBS ${TARGET_LIB_FAISS})
+endif ()
+
+# ---------------------------------- PUCK ----------------------------------
+if (${CONFIG_PUCK} STREQUAL ON OR ${CONFIG_ALL} STREQUAL ON)
+    # Initialize Puck submodule and apply patches
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/init-puck.cmake)
+
+    # Define FINTEGER for MKL compatibility
+    add_definitions(-DFINTEGER=int)
+
+    # Add Puck cmake modules to path for FindMKL
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external/puck/cmake")
+
+    # Find MKL package
+    find_package(MKL REQUIRED)
+
+    # Fix MKL_H variable - FindMKL.cmake sets it incorrectly
+    # MKL_H should point to the directory containing mkl.h, not the file itself
+    # This must be done BEFORE add_subdirectory to affect Puck's CMakeLists
+    if(DEFINED ENV{MKLROOT})
+        set(MKL_H "$ENV{MKLROOT}/include" CACHE PATH "MKL include directory" FORCE)
+        set(MKL_INCLUDE_DIR "$ENV{MKLROOT}/include" CACHE PATH "MKL include directory" FORCE)
+    endif()
+
+    # Add Puck subdirectory and configure build
+    add_subdirectory(external/puck)
+
+    # Create Puck JNI library
+    add_library(
+        ${TARGET_LIB_PUCK} SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_PuckService.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/puck_wrapper.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/puck_index_service.cpp
+    )
+
+    # Link with Puck library and utilities
+    # Add shared gomp library explicitly to avoid static linking issues
+    target_link_libraries(${TARGET_LIB_PUCK} puck ${TARGET_LIB_UTIL} ${MKL_LIBRARIES} -lgomp)
+
+    target_include_directories(${TARGET_LIB_PUCK} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $ENV{JAVA_HOME}/include
+        $ENV{JAVA_HOME}/include/${JVM_OS_TYPE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/puck
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/puck/puck
+        ${GFLAGS_INCLUDE_DIR}
+        ${GLOG_INCLUDE_DIR}
+        ${MKL_INCLUDE_DIR}
+    )
+
+    opensearch_set_common_properties(${TARGET_LIB_PUCK})
+    list(APPEND TARGET_LIBS ${TARGET_LIB_PUCK})
 endif ()
 
 # ---------------------------------------------------------------------------

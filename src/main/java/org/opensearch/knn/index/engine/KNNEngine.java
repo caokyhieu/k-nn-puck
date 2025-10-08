@@ -11,6 +11,7 @@ import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.engine.faiss.Faiss;
 import org.opensearch.knn.index.engine.lucene.Lucene;
 import org.opensearch.knn.index.engine.nmslib.Nmslib;
+import org.opensearch.knn.index.engine.puck.Puck;
 
 import java.util.List;
 import java.util.Map;
@@ -19,6 +20,7 @@ import java.util.Set;
 import static org.opensearch.knn.common.KNNConstants.FAISS_NAME;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_NAME;
 import static org.opensearch.knn.common.KNNConstants.NMSLIB_NAME;
+import static org.opensearch.knn.common.KNNConstants.PUCK_NAME;
 
 /**
  * KNNEngine provides the functionality to validate and transform user defined indices into information that can be
@@ -28,15 +30,24 @@ public enum KNNEngine implements KNNLibrary {
     @Deprecated(since = "2.19.0", forRemoval = true)
     NMSLIB(NMSLIB_NAME, Nmslib.INSTANCE),
     FAISS(FAISS_NAME, Faiss.INSTANCE),
-    LUCENE(LUCENE_NAME, Lucene.INSTANCE);
+    LUCENE(LUCENE_NAME, Lucene.INSTANCE),
+    PUCK(PUCK_NAME, Puck.INSTANCE);
 
     public static final KNNEngine DEFAULT = FAISS;
 
-    private static final Set<KNNEngine> CUSTOM_SEGMENT_FILE_ENGINES = ImmutableSet.of(KNNEngine.NMSLIB, KNNEngine.FAISS);
-    private static final Set<KNNEngine> ENGINES_SUPPORTING_FILTERS = ImmutableSet.of(KNNEngine.LUCENE, KNNEngine.FAISS);
-    public static final Set<KNNEngine> ENGINES_SUPPORTING_RADIAL_SEARCH = ImmutableSet.of(KNNEngine.LUCENE, KNNEngine.FAISS);
+    private static final Set<KNNEngine> CUSTOM_SEGMENT_FILE_ENGINES = ImmutableSet.of(KNNEngine.NMSLIB, KNNEngine.FAISS, KNNEngine.PUCK);
+    private static final Set<KNNEngine> ENGINES_SUPPORTING_FILTERS = ImmutableSet.of(KNNEngine.LUCENE, KNNEngine.FAISS, KNNEngine.PUCK);
+    public static final Set<KNNEngine> ENGINES_SUPPORTING_RADIAL_SEARCH = ImmutableSet.of(
+        KNNEngine.LUCENE,
+        KNNEngine.FAISS,
+        KNNEngine.PUCK
+    );
     public static final Set<KNNEngine> DEPRECATED_ENGINES = ImmutableSet.of(KNNEngine.NMSLIB);
-    public static final Set<KNNEngine> ENGINES_SUPPORTING_NESTED_FIELDS = ImmutableSet.of(KNNEngine.LUCENE, KNNEngine.FAISS);
+    public static final Set<KNNEngine> ENGINES_SUPPORTING_NESTED_FIELDS = ImmutableSet.of(
+        KNNEngine.LUCENE,
+        KNNEngine.FAISS,
+        KNNEngine.PUCK
+    );
 
     private static Map<KNNEngine, Integer> MAX_DIMENSIONS_BY_ENGINE = Map.of(
         KNNEngine.NMSLIB,
@@ -44,6 +55,8 @@ public enum KNNEngine implements KNNLibrary {
         KNNEngine.FAISS,
         16_000,
         KNNEngine.LUCENE,
+        16_000,
+        KNNEngine.PUCK,
         16_000
     );
 
@@ -80,6 +93,10 @@ public enum KNNEngine implements KNNLibrary {
             return LUCENE;
         }
 
+        if (PUCK.getName().equalsIgnoreCase(name)) {
+            return PUCK;
+        }
+
         throw new IllegalArgumentException(String.format("Invalid engine type: %s", name));
     }
 
@@ -96,6 +113,10 @@ public enum KNNEngine implements KNNLibrary {
 
         if (path.endsWith(KNNEngine.FAISS.getExtension()) || path.endsWith(KNNEngine.FAISS.getCompoundExtension())) {
             return KNNEngine.FAISS;
+        }
+
+        if (path.endsWith(KNNEngine.PUCK.getExtension()) || path.endsWith(KNNEngine.PUCK.getCompoundExtension())) {
+            return KNNEngine.PUCK;
         }
 
         throw new IllegalArgumentException("No engine matches the path's suffix");

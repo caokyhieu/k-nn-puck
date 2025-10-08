@@ -347,6 +347,13 @@ task cmakeJniLib(type:Exec) {
         args.add("-DBLAS_LIBRARIES=$rootDir\\src\\main\\resources\\windowsDependencies\\libopenblas.dll")
         args.add("-DLAPACK_LIBRARIES=$rootDir\\src\\main\\resources\\windowsDependencies\\libopenblas.dll")
     }
+    // Set MKL environment for Puck build
+    def mklRoot = System.getenv("MKLROOT") ?: "/opt/intel/oneapi/mkl/latest"
+    environment('MKLROOT', mklRoot)
+    environment('LD_LIBRARY_PATH', "${mklRoot}/lib:${System.getenv('LD_LIBRARY_PATH') ?: ''}")
+    environment('CPATH', "${mklRoot}/include:${System.getenv('CPATH') ?: ''}")
+    environment('LIBRARY_PATH', "${mklRoot}/lib:${System.getenv('LIBRARY_PATH') ?: ''}")
+    environment('BLA_VENDOR', 'Intel10_64lp')
 
     commandLine args
 }
@@ -357,14 +364,50 @@ task buildNmslib(type:Exec) {
     commandLine 'make', 'opensearchknn_nmslib', '-j', "${nproc_count}"
 }
 
+task cmakePuck(type:Exec) {
+    workingDir 'jni'
+    def args = []
+    args.add("bash")
+    args.add("-c")
+    // Set MKL environment variables first, then run cmake
+    def mklRoot = System.getenv("MKLROOT") ?: "/opt/intel/oneapi/mkl/latest"
+    def cmakeCmd = "source /opt/intel/oneapi/setvars.sh --force && " +
+                   "cmake . " +
+                   "-DCONFIG_PUCK=ON " +
+                   "-DKNN_PLUGIN_VERSION=${opensearch_version} " +
+                   "-DAVX2_ENABLED=${avx2_enabled} " +
+                   "-DAVX512_ENABLED=${avx512_enabled} " +
+                   "-DAVX512_SPR_ENABLED=${avx512_spr_enabled} " +
+                   "-DCOMMIT_LIB_PATCHES=${commit_lib_patches} " +
+                   "-DAPPLY_LIB_PATCHES=${apply_lib_patches}"
+    args.add(cmakeCmd)
+    def javaHome = Jvm.current().getJavaHome()
+    if (Os.isFamily(Os.FAMILY_MAC)) {
+        environment('JAVA_HOME',javaHome)
+    }
+    commandLine args
+}
+
+task buildPuck(type:Exec) {
+    dependsOn cmakePuck
+    workingDir 'jni'
+    def args = []
+    args.add("bash")
+    args.add("-c")
+    def makeCmd = "source /opt/intel/oneapi/setvars.sh --force && make opensearchknn_puck -j ${nproc_count}"
+    args.add(makeCmd)
+    commandLine args
+}
+
 task buildJniLib(type:Exec) {
     dependsOn cmakeJniLib
     workingDir 'jni'
-    commandLine 'make', 'opensearchknn_faiss', 'opensearchknn_common', '-j', "${nproc_count}"
+    commandLine 'make', 'opensearchknn_util', 'opensearchknn_common', 'opensearchknn_faiss', '-j', "${nproc_count}"
 }
 
 test {
     dependsOn buildNmslib
+    dependsOn buildPuck
     dependsOn buildJniLib
     systemProperty 'tests.security.manager', 'false'
     systemProperty "java.library.path", "$rootDir/jni/release"

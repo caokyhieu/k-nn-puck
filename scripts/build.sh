@@ -78,6 +78,7 @@ work_dir=$PWD
 # Otherwise, the submodule update call may fail on earlier versions of git.
 git submodule update --init -- jni/external/nmslib
 git submodule update --init -- jni/external/faiss
+git submodule update --init -- jni/external/puck
 
 # Setup compile time dependency for Windows only
 # As Linux version already have OpenBlas in the runner
@@ -135,6 +136,17 @@ if [ "$PLATFORM" != "windows" ] && [ "$ARCHITECTURE" = "x64" ]; then
   rm -rf jni/CMakeCache.txt jni/CMakeFiles
   env CC=gcc10-gcc CXX=gcc10-g++ FC=gcc10-gfortran ./gradlew :buildNmslib -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
 
+  echo "Building k-NN library Puck"
+  # Puck requires Intel MKL - build with MKL environment if available
+  rm -rf jni/CMakeCache.txt jni/CMakeFiles
+  if [ -f "/opt/intel/oneapi/setvars.sh" ]; then
+    echo "Intel MKL found, building Puck with MKL support"
+    source /opt/intel/oneapi/setvars.sh --force
+    ./gradlew :buildPuck -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
+  else
+    echo "Warning: Intel MKL not found at /opt/intel/oneapi/setvars.sh, skipping Puck build"
+  fi
+
   echo "Building k-NN library after enabling AVX2"
   # Skip applying patches as patches were applied already from previous :buildJniLib task
   # If we apply patches again, it fails with conflict
@@ -149,6 +161,14 @@ if [ "$PLATFORM" != "windows" ] && [ "$ARCHITECTURE" = "x64" ]; then
 
 else
   ./gradlew :buildNmslib -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
+
+  # Build Puck for non-x64 platforms if MKL is available
+  if [ -f "/opt/intel/oneapi/setvars.sh" ]; then
+    echo "Building k-NN library Puck"
+    rm -rf jni/CMakeCache.txt jni/CMakeFiles
+    source /opt/intel/oneapi/setvars.sh --force
+    ./gradlew :buildPuck -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
+  fi
 fi
 
 ./gradlew publishPluginZipPublicationToZipStagingRepository -Dopensearch.version=$VERSION -Dbuild.snapshot=$SNAPSHOT -Dbuild.version_qualifier=$QUALIFIER
