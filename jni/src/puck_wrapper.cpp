@@ -13,6 +13,8 @@
 // Include Puck headers
 #include "puck/index.h"
 #include "puck/hierarchical_cluster/hierarchical_cluster_index.h"
+#include "puck/puck/puck_index.h"
+#include "puck/gflags/puck_gflags.h"
 
 #include <memory>
 #include <vector>
@@ -26,6 +28,20 @@
 
 namespace knn_jni {
 namespace puck_wrapper {
+
+// Metadata structure to store loaded index data
+struct IndexMetadata {
+    std::vector<int> ids;
+    std::vector<float> vectors;
+    std::vector<uint32_t> cellAssignments;
+    uint32_t dimension;
+    uint32_t numVectors;
+    std::unique_ptr<puck::HierarchicalClusterIndex> puckIndex;
+
+    ~IndexMetadata() {
+        // Destructor will automatically clean up puckIndex
+    }
+};
 
 jlong knn_new_index(jlong numDocs, jint dimension, const std::unordered_map<std::string, jobject>& parameters) {
     try {
@@ -99,27 +115,43 @@ int knn_query_index(jlong indexPointer, jfloat* queryVector, jint dimension, jin
             throw std::invalid_argument("Index pointer is null");
         }
 
-        auto* index = reinterpret_cast<puck::HierarchicalClusterIndex*>(indexPointer);
-
-        // Convert query vector
-        std::vector<float> query(queryVector, queryVector + dimension);
-
-        // Convert parameters
-        std::unordered_map<std::string, std::string> stringParams;
-        for (const auto& param : parameters) {
-            stringParams[param.first] = "default"; // Placeholder
+        // Get metadata structure from pointer
+        auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointer);
+        if (!metadata || !metadata->puckIndex) {
+            throw std::runtime_error("Invalid index metadata or Puck index is null");
         }
 
-        // Query the index
-        auto results = knn_jni::puck_index_service::PuckIndexService::queryIndex(
-            index, query, k, stringParams
-        );
+        // Create Puck Request
+        puck::Request request;
+        request.feature = queryVector;
+        request.topk = k;
 
-        // Copy results to output arrays
-        int resultCount = std::min(k, static_cast<jint>(results.size()));
-        for (int i = 0; i < resultCount; ++i) {
-            distances[i] = results[i].first;
-            indices[i] = results[i].second;
+        // Create Response with result buffers
+        puck::Response response;
+        std::vector<float> responseDistances(k);
+        std::vector<uint32_t> responseMemoryIndices(k);
+        response.distance = responseDistances.data();
+        response.local_idx = responseMemoryIndices.data();
+
+        // Execute search
+        int searchResult = metadata->puckIndex->search(&request, &response);
+        if (searchResult != 0) {
+            throw std::runtime_error("Puck search failed with error code: " + std::to_string(searchResult));
+        }
+
+        // Map results: memory indices → document IDs
+        int resultCount = std::min(k, static_cast<jint>(response.result_num));
+        for (int i = 0; i < resultCount; i++) {
+            distances[i] = response.distance[i];
+
+            // Map internal memory index to original document ID
+            uint32_t memoryIdx = response.local_idx[i];
+            if (memoryIdx < metadata->ids.size()) {
+                indices[i] = static_cast<jlong>(metadata->ids[memoryIdx]);
+            } else {
+                throw std::runtime_error("Invalid memory index returned by Puck: " +
+                                       std::to_string(memoryIdx));
+            }
         }
 
         return resultCount;
@@ -132,8 +164,8 @@ int knn_query_index(jlong indexPointer, jfloat* queryVector, jint dimension, jin
 void knn_free_index(jlong indexPointer) {
     try {
         if (indexPointer != 0) {
-            auto* index = reinterpret_cast<puck::HierarchicalClusterIndex*>(indexPointer);
-            delete index;
+            auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointer);
+            delete metadata;  // Destructor will clean up puckIndex
         }
     } catch (const std::exception& e) {
         // Log error but don't throw from destructor-like function
@@ -252,7 +284,7 @@ jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) 
         knn_jni::stream::NativeEngineIndexInputMediator mediator {jniUtil, env, input};
         puck_stream::PuckOpenSearchIOReader reader(&mediator);
 
-        // Read the header we wrote in CreateIndex
+        // === READ HEADER ===
         uint32_t magic = reader.readUInt();
         if (magic != 0x5055434B) { // 'PUCK' in hex
             throw std::runtime_error("Invalid Puck index format - magic number mismatch");
@@ -263,39 +295,100 @@ jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) 
             throw std::runtime_error("Unsupported Puck index version: " + std::to_string(version));
         }
 
-        int numVectors = reader.readInt();
-        int dim = reader.readInt();
+        // === READ METADATA ===
+        uint32_t dimension = reader.readUInt();
+        uint32_t numVectors = reader.readUInt();
 
-        if (numVectors <= 0 || dim <= 0) {
+        if (numVectors == 0 || dimension == 0) {
             throw std::runtime_error("Invalid index metadata: numVectors=" + std::to_string(numVectors) +
-                                   ", dim=" + std::to_string(dim));
+                                   ", dimension=" + std::to_string(dimension));
         }
 
-        // Read IDs
+        // === READ ID MAPPING ===
         std::vector<int> ids(numVectors);
         reader.read(ids.data(), numVectors * sizeof(int));
 
-        // Read vectors
-        std::vector<float> vectors(numVectors * dim);
-        reader.read(vectors.data(), numVectors * dim * sizeof(float));
+        // === READ VECTORS ===
+        std::vector<float> vectors(numVectors * dimension);
+        reader.read(vectors.data(), numVectors * dimension * sizeof(float));
 
-        // Create a new Puck index
-        auto index = std::make_unique<puck::HierarchicalClusterIndex>();
-        if (!index) {
-            throw std::runtime_error("Failed to create HierarchicalClusterIndex for loading");
+        // === READ CELL ASSIGNMENTS ===
+        std::vector<uint32_t> cellAssignments(numVectors);
+        reader.read(cellAssignments.data(), numVectors * sizeof(uint32_t));
+
+        // === READ TRAINED MODEL (codebooks) ===
+        int32_t numModelFiles = reader.readInt();
+
+        // Create temporary directory to store model files
+        std::string tempDir = "/tmp/puck_load_" + std::to_string(std::time(nullptr)) + "_" +
+                             std::to_string(::getpid());
+        if (::mkdir(tempDir.c_str(), 0700) != 0) {
+            throw std::runtime_error("Failed to create temporary directory: " + tempDir);
         }
 
-        // Initialize the index
-        int result = index->init();
-        if (result != 0) {
-            throw std::runtime_error("Failed to initialize loaded Puck index, error code: " + std::to_string(result));
+        try {
+            // Deserialize model files
+            for (int32_t i = 0; i < numModelFiles; i++) {
+                // Read filename
+                int32_t nameLen = reader.readInt();
+                std::vector<char> nameBuffer(nameLen + 1, '\0');
+                reader.read(nameBuffer.data(), nameLen);
+                std::string filename(nameBuffer.data(), nameLen);
+
+                // Read file size
+                int64_t fileSize = reader.readLong();
+
+                // Read file content
+                std::vector<char> fileBuffer(fileSize);
+                reader.read(fileBuffer.data(), fileSize);
+
+                // Write to temp file
+                std::string filepath = tempDir + "/" + filename;
+                std::ofstream outFile(filepath, std::ios::binary);
+                if (!outFile.is_open()) {
+                    throw std::runtime_error("Failed to create file: " + filepath);
+                }
+                outFile.write(fileBuffer.data(), fileSize);
+                outFile.close();
+            }
+
+            // Configure Puck to use the temp directory
+            google::SetCommandLineOption("index_path", tempDir.c_str());
+            google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
+
+            // Create and initialize the index with trained codebooks
+            auto index = std::make_unique<puck::HierarchicalClusterIndex>();
+            if (!index) {
+                throw std::runtime_error("Failed to create HierarchicalClusterIndex for loading");
+            }
+
+            // Initialize loads the codebooks from temp directory
+            int initResult = index->init();
+            if (initResult != 0) {
+                throw std::runtime_error("Failed to initialize loaded Puck index, error code: " + std::to_string(initResult));
+            }
+
+            // Create a metadata structure to store index data
+            auto* metadata = new IndexMetadata();
+            metadata->ids = std::move(ids);
+            metadata->vectors = std::move(vectors);
+            metadata->cellAssignments = std::move(cellAssignments);
+            metadata->dimension = dimension;
+            metadata->numVectors = numVectors;
+            metadata->puckIndex = std::move(index);
+
+            // Cleanup temp directory
+            int cleanupResult = ::system(("rm -rf " + tempDir).c_str());
+            (void)cleanupResult;
+
+            return reinterpret_cast<jlong>(metadata);
+
+        } catch (...) {
+            // Cleanup on error
+            int cleanupResult = ::system(("rm -rf " + tempDir).c_str());
+            (void)cleanupResult;
+            throw;
         }
-
-        // Note: In a full implementation, you would need to rebuild the index structure
-        // from the loaded vectors. For now, this creates a minimal index.
-        // Puck indexes typically require offline training and proper building.
-
-        return reinterpret_cast<jlong>(index.release());
 
     } catch (const std::exception& e) {
         throw std::runtime_error("Failed to load Puck index: " + std::string(e.what()));
@@ -308,18 +401,34 @@ jbyteArray TrainIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject p
         throw std::runtime_error("Parameters cannot be null");
     }
 
+    if (trainVectorsPointerJ == 0) {
+        throw std::runtime_error("Training vectors pointer is 0 (null)");
+    }
+
     try {
         // Extract training vectors from pointer
+        // IMPORTANT: This pointer is managed by Java side - we must not delete it
         auto* trainingVectorsPointer = reinterpret_cast<std::vector<float>*>(trainVectorsPointerJ);
         if (trainingVectorsPointer == nullptr) {
-            throw std::runtime_error("Training vectors pointer is null");
+            throw std::runtime_error("Training vectors pointer is null after cast");
         }
 
         int dimension = static_cast<int>(dimensionJ);
-        int numVectors = trainingVectorsPointer->size() / dimension;
+
+        // Validate the vector pointer is accessible
+        size_t vectorSize = 0;
+        try {
+            vectorSize = trainingVectorsPointer->size();
+        } catch (...) {
+            throw std::runtime_error("Training vectors pointer is invalid - cannot access size()");
+        }
+
+        int numVectors = vectorSize / dimension;
 
         if (numVectors <= 0) {
-            throw std::runtime_error("No training vectors provided");
+            throw std::runtime_error("No training vectors provided (numVectors=" + std::to_string(numVectors) +
+                                   ", vectorSize=" + std::to_string(vectorSize) +
+                                   ", dimension=" + std::to_string(dimension) + ")");
         }
 
         // Convert Java parameters to C++ map
@@ -396,34 +505,42 @@ jbyteArray TrainIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject p
             confOut << "index_file_name=" << tempDir << "/index.dat" << std::endl;
             confOut.close();
 
-            // Set environment to point to config file
-            // Puck reads from FLAGS or environment
-            setenv("PUCK_INDEX_PATH", tempDir.c_str(), 1);
+            // Now perform actual Puck training
+            std::cerr << "Starting Puck training with " << numVectors << " vectors, dimension=" << dimension << std::endl;
+            std::cerr << "Parameters: coarse_clusters=" << coarseClusters << ", fine_clusters=" << fineClusters
+                      << ", pq_m=" << pqM << ", pq_nbits=" << pqNbits << std::endl;
 
-            // Create and train Puck index
-            auto index = std::make_unique<puck::HierarchicalClusterIndex>();
-            if (!index) {
-                throw std::runtime_error("Failed to create HierarchicalClusterIndex");
+            // Configure Puck using gflags (this is how Puck's IndexConf reads configuration)
+            google::SetCommandLineOption("index_path", tempDir.c_str());
+            google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
+            google::SetCommandLineOption("coarse_cluster_count", std::to_string(coarseClusters).c_str());
+            google::SetCommandLineOption("fine_cluster_count", std::to_string(fineClusters).c_str());
+            google::SetCommandLineOption("nsq", std::to_string(pqM).c_str());
+            google::SetCommandLineOption("whether_pq", "true");
+            google::SetCommandLineOption("whether_norm", "false");
+            google::SetCommandLineOption("threads_count", "8");
+            google::SetCommandLineOption("feature_file_name", "train_vectors.fvecs");
+            google::SetCommandLineOption("coarse_codebook_file_name", "coarse_codebook.dat");
+            google::SetCommandLineOption("fine_codebook_file_name", "fine_codebook.dat");
+            google::SetCommandLineOption("pq_codebook_file_name", "pq_codebook.dat");
+            google::SetCommandLineOption("cell_assign_file_name", "cell_assign.dat");
+            google::SetCommandLineOption("index_file_name", "index.dat");
+            google::SetCommandLineOption("pq_data_file_name", "pq_data.dat");
+
+            // Create Puck index (IndexConf constructor will read from FLAGS)
+            auto puckIndex = std::make_unique<puck::PuckIndex>();
+            if (!puckIndex) {
+                throw std::runtime_error("Failed to create PuckIndex");
             }
 
-            // Initialize index (loads config)
-            int initResult = index->init();
-            if (initResult != 0) {
-                throw std::runtime_error("Failed to initialize Puck index for training, error code: " +
-                                       std::to_string(initResult));
-            }
-
-            // Train the index (builds hierarchical clusters and PQ codebooks)
-            int trainResult = index->train();
+            // Train the index
+            std::cerr << "Calling puck train()..." << std::endl;
+            int trainResult = puckIndex->train();
             if (trainResult != 0) {
                 throw std::runtime_error("Puck training failed with error code: " + std::to_string(trainResult));
             }
 
-            // Build the index (assigns vectors to clusters)
-            int buildResult = index->build();
-            if (buildResult != 0) {
-                throw std::runtime_error("Puck build failed with error code: " + std::to_string(buildResult));
-            }
+            std::cerr << "Puck training completed successfully" << std::endl;
 
             // Serialize trained index to byte array
             // We need to save the index and all its files, then read them back
@@ -632,64 +749,101 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
             }
             vecOut.close();
 
+            // Configure Puck using gflags for this temp directory
+            google::SetCommandLineOption("index_path", tempDir.c_str());
+            google::SetCommandLineOption("feature_file_name", vectorsFile.c_str());
+
             // Load the trained index
             auto index = std::make_unique<puck::HierarchicalClusterIndex>();
             if (!index) {
                 throw std::runtime_error("Failed to create HierarchicalClusterIndex");
             }
 
-            // Set environment to point to the model directory
-            setenv("PUCK_INDEX_PATH", tempDir.c_str(), 1);
-
-            // Initialize index (loads the trained codebooks)
-            int initResult = index->init();
+            // Initialize for single build (loads the trained codebooks)
+            int initResult = index->init_single_build();
             if (initResult != 0) {
-                throw std::runtime_error("Failed to initialize Puck index from template, error code: " +
+                throw std::runtime_error("Failed to init_single_build Puck index from template, error code: " +
                                        std::to_string(initResult));
             }
 
-            // The index is now loaded with trained codebooks
-            // In a full implementation, we would need to add the vectors to the index
-            // For now, we'll serialize the index with the vectors included
+            // Build the index by assigning each vector to its nearest cell
+            std::vector<uint32_t> cellAssignments(numVectors);
 
-            // Write index to output stream
+            for (int i = 0; i < numVectors; i++) {
+                puck::BuildInfo buildInfo;
+                buildInfo.feature.assign(
+                    inputVectors->data() + i * dim,
+                    inputVectors->data() + (i + 1) * dim
+                );
+
+                // Assign vector to nearest cell
+                int buildResult = index->single_build(&buildInfo);
+                if (buildResult != 0) {
+                    throw std::runtime_error("Failed to build vector " + std::to_string(i) +
+                                           ", error code: " + std::to_string(buildResult));
+                }
+
+                cellAssignments[i] = buildInfo.nearest_cell.cell_id;
+            }
+
+            // Write index to output stream using proposed format from PUCK_TRAINING_FLOW.md
             knn_jni::stream::NativeEngineIndexOutputMediator mediator {jniUtil, env, output};
 
-            // Write a simple header
+            // === HEADER ===
             uint32_t magic = 0x5055434B; // 'PUCK' in hex
             uint32_t version = 1;
             mediator.writeBytes(reinterpret_cast<const uint8_t*>(&magic), sizeof(magic));
             mediator.writeBytes(reinterpret_cast<const uint8_t*>(&version), sizeof(version));
-            mediator.writeBytes(reinterpret_cast<const uint8_t*>(&numVectors), sizeof(numVectors));
-            mediator.writeBytes(reinterpret_cast<const uint8_t*>(&dim), sizeof(dim));
 
-            // Write IDs
+            // === METADATA ===
+            uint32_t dimension = dim;
+            uint32_t numVectorsU32 = static_cast<uint32_t>(numVectors);
+            mediator.writeBytes(reinterpret_cast<const uint8_t*>(&dimension), sizeof(dimension));
+            mediator.writeBytes(reinterpret_cast<const uint8_t*>(&numVectorsU32), sizeof(numVectorsU32));
+
+            // === ID MAPPING ===
             mediator.writeBytes(reinterpret_cast<const uint8_t*>(ids), numVectors * sizeof(jint));
             jniUtil->ReleaseIntArrayElements(env, idsJ, ids, JNI_ABORT);
 
-            // Write vectors
+            // === VECTORS (full vectors, PQ not yet implemented) ===
             mediator.writeBytes(reinterpret_cast<const uint8_t*>(inputVectors->data()),
                               numVectors * dim * sizeof(float));
 
-            // Write trained model files (codebooks)
-            for (int32_t i = 0; i < numFiles; i++) {
-                // Re-read and write each file
-                std::string indexDatPath = tempDir + "/index.dat";
-                std::ifstream indexDat(indexDatPath);
-                std::string line;
-                std::vector<std::string> modelFiles;
+            // === CELL ASSIGNMENTS ===
+            mediator.writeBytes(reinterpret_cast<const uint8_t*>(cellAssignments.data()),
+                              numVectors * sizeof(uint32_t));
 
-                // Extract file paths from index.dat
-                while (std::getline(indexDat, line)) {
-                    if (line.find("_file_name=") != std::string::npos ||
-                        line.find("_codebook=") != std::string::npos) {
-                        size_t pos = line.find('=');
-                        if (pos != std::string::npos) {
-                            std::string filePath = line.substr(pos + 1);
-                            if (!filePath.empty()) {
-                                modelFiles.push_back(filePath);
-                            }
-                        }
+            // === TRAINED MODEL (codebooks) ===
+            // Serialize the model files that were deserialized earlier
+            int32_t numModelFiles = numFiles;
+            mediator.writeBytes(reinterpret_cast<const uint8_t*>(&numModelFiles), sizeof(numModelFiles));
+
+            // Re-serialize each model file
+            for (int32_t i = 0; i < numFiles; i++) {
+                // Read back filename from temp directory
+                std::vector<std::string> filenames = {"coarse_codebook.dat", "fine_codebook.dat", "index.dat"};
+                if (i < static_cast<int32_t>(filenames.size())) {
+                    std::string filename = filenames[i];
+                    std::string filepath = tempDir + "/" + filename;
+
+                    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+                    if (file.is_open()) {
+                        std::streamsize fileSize = file.tellg();
+                        file.seekg(0, std::ios::beg);
+
+                        // Write filename
+                        int32_t nameLen = filename.length();
+                        mediator.writeBytes(reinterpret_cast<const uint8_t*>(&nameLen), sizeof(nameLen));
+                        mediator.writeBytes(reinterpret_cast<const uint8_t*>(filename.c_str()), nameLen);
+
+                        // Write file size
+                        int64_t fileSizeI64 = fileSize;
+                        mediator.writeBytes(reinterpret_cast<const uint8_t*>(&fileSizeI64), sizeof(fileSizeI64));
+
+                        // Write file content
+                        std::vector<char> buffer(fileSize);
+                        file.read(buffer.data(), fileSize);
+                        mediator.writeBytes(reinterpret_cast<const uint8_t*>(buffer.data()), fileSize);
                     }
                 }
             }

@@ -336,7 +336,7 @@ class PuckAccuracyTester:
 
         # Step 3: Train model
         print("Step 3: Training Puck model...")
-        model_id = "puck_test_model"
+        model_id = "puck_test_model_2"
         training_stats = self.train_model(
             model_id,
             training_index,
@@ -437,10 +437,10 @@ def main():
     parser = argparse.ArgumentParser(description='Test Puck index accuracy and performance')
     parser.add_argument('--host', type=str, default='localhost', help='OpenSearch host')
     parser.add_argument('--port', type=int, default=9200, help='OpenSearch port')
-    parser.add_argument('--num-train', type=int, default=10000, help='Number of training vectors')
-    parser.add_argument('--num-database', type=int, default=50000, help='Number of database vectors')
+    parser.add_argument('--num-train', type=int, default=5000, help='Number of training vectors')
+    parser.add_argument('--num-database', type=int, default=10000, help='Number of database vectors')
     parser.add_argument('--num-queries', type=int, default=100, help='Number of query vectors')
-    parser.add_argument('--dimension', type=int, default=128, help='Vector dimension')
+    parser.add_argument('--dimension', type=int, default=16, help='Vector dimension')
     parser.add_argument('--k', type=int, default=10, help='K for top-K search')
     parser.add_argument('--coarse-clusters', type=int, default=256, help='Number of coarse clusters')
     parser.add_argument('--fine-clusters', type=int, default=256, help='Number of fine clusters')

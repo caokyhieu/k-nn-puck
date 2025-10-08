@@ -1,0 +1,53 @@
+From: OpenSearch k-NN Integration
+Date: Wed, 8 Oct 2025 22:00:00 +0000
+Subject: [PATCH] Fix CPU frequency reading crash with safer file handling
+
+The read_cpu_frequency function can crash when reading /proc/cpuinfo
+due to unsafe buffer handling. This patch adds proper checks and
+safer file operations.
+
+---
+ puck/base/time.cpp | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/puck/base/time.cpp b/puck/base/time.cpp
+index 1234567..abcdef0 100644
+--- a/puck/base/time.cpp
++++ b/puck/base/time.cpp
+@@ -88,6 +88,11 @@ int64_t read_cpu_frequency(bool* invariant_tsc) {
+     fd = open("/proc/cpuinfo", O_RDONLY);
+     if (fd == -1) {
+         // cannot open /proc/cpuinfo
++        if (invariant_tsc) {
++            *invariant_tsc = false;
++        }
++        // Return a safe default value instead of uninitialized
++        return 0;
+     } else {
+         //const size_t n = 2 << 12;  // 8192
+         char buf[1 << 16];
+@@ -98,6 +103,11 @@ int64_t read_cpu_frequency(bool* invariant_tsc) {
+         }
+         close(fd);
+
++        // Ensure buffer is null-terminated
++        if (n >= sizeof(buf)) {
++            n = sizeof(buf) - 1;
++        }
++        buf[n] = '\0';
++
+         char* pos = strstr(buf, "cpu MHz");
+         if (pos) {
+             pos = strchr(pos, ':');
+@@ -108,7 +118,7 @@ int64_t read_cpu_frequency(bool* invariant_tsc) {
+             char* flags_pos = strstr(buf, "flags");
+             *invariant_tsc =
+                 (flags_pos &&
+-                 memmem(flags_pos, buf + n - flags_pos, "constant_tsc", 12) &&
+-                 memmem(flags_pos, buf + n - flags_pos, "nonstop_tsc", 11));
++                 strstr(flags_pos, "constant_tsc") != NULL &&
++                 strstr(flags_pos, "nonstop_tsc") != NULL);
+         }
+     }
+--
+2.34.1

@@ -92,6 +92,15 @@ find_package(ZLIB REQUIRED)
 # Use shared BLAS libraries to avoid OpenMP static linking issues
 # Static libgomp.a causes relocation errors when building shared libraries
 set(BLA_STATIC OFF)
+# Use Intel MKL for BLAS/LAPACK
+if(DEFINED ENV{MKLROOT})
+    set(BLA_VENDOR Intel10_64lp)
+    set(MKL_ROOT $ENV{MKLROOT})
+    set(BLA_PREFER_PKGCONFIG ON)
+else()
+    # If MKL is not available, use any BLAS library
+    message(WARNING "MKLROOT environment variable not set. Will search for any BLAS library.")
+endif()
 find_package(BLAS REQUIRED)
 enable_language(Fortran)
 find_package(LAPACK REQUIRED)

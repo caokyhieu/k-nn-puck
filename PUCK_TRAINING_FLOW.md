@@ -545,3 +545,485 @@ The error shows that validateTrainingConfig is null in TrainingModelRequest.java
 ● Search(pattern: "getTrainingConfigValidationSetup|trainingConfigValidationSetup", path:
         "src/main/java/org/opensearch/knn/index/engine", output_mode: "content")
   ⎿  Found 25 lines (ctrl+o to expand)
+---
+
+## UPDATED IMPLEMENTATION DETAILS (2025-10-08)
+
+### Phase-by-Phase Implementation Summary
+
+#### Phase 1: ✅ COMPLETED - Training Infrastructure
+
+**Location:** `jni/src/puck_wrapper.cpp` lines 305-523
+
+**Implementation Approach:**
+- Uses **temporary directory** for Puck's file-based operations
+- Configures Puck via **gflags** (google::SetCommandLineOption)
+- Serializes trained model files to byte array for storage
+
+**Key Code:**
+```cpp
+jbyteArray TrainIndex(JNIUtilInterface *jniUtil, JNIEnv *env,
+                      jobject parametersJ, jint dimensionJ, jlong trainVectorsPointerJ) {
+    // 1. Extract parameters from Java Map
+    int coarseClusters = getIntParam("coarse_clusters", 256);
+    int fineClusters = getIntParam("fine_clusters", 256);
+    int pqM = getIntParam("pq_m", 8);
+    int pqNbits = getIntParam("pq_nbits", 8);
+    
+    // 2. Create temp directory: /tmp/puck_train_<timestamp>_<pid>
+    std::string tempDir = "/tmp/puck_train_" + std::to_string(std::time(nullptr));
+    
+    // 3. Write training vectors in fvecs format
+    std::ofstream out(vectorsFile, std::ios::binary);
+    for (int i = 0; i < numVectors; i++) {
+        int32_t dim = dimension;
+        out.write((char*)&dim, sizeof(int32_t));
+        const float* vec = trainingVectorsPointer->data() + (i * dimension);
+        out.write((char*)vec, dimension * sizeof(float));
+    }
+    
+    // 4. Configure Puck using gflags
+    google::SetCommandLineOption("index_path", tempDir.c_str());
+    google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
+    google::SetCommandLineOption("coarse_cluster_count", std::to_string(coarseClusters).c_str());
+    google::SetCommandLineOption("fine_cluster_count", std::to_string(fineClusters).c_str());
+    google::SetCommandLineOption("nsq", std::to_string(pqM).c_str());
+    google::SetCommandLineOption("whether_pq", "true");
+    
+    // 5. Create PuckIndex (constructor reads FLAGS)
+    auto puckIndex = std::make_unique<puck::PuckIndex>();
+    
+    // 6. Train (creates codebook files in tempDir)
+    int trainResult = puckIndex->train();
+    
+    // 7. Serialize files to byte array
+    // Format: [numFiles][file1_len][name][size][data][file2_len]...
+    std::vector<uint8_t> serialized;
+    for (const auto& file : filesToSerialize) {
+        // Serialize each codebook file
+    }
+    
+    // 8. Cleanup and return
+    ::system(("rm -rf " + tempDir).c_str());
+    return jbyteArray;
+}
+```
+
+**Files Generated During Training:**
+1. `coarse_codebook.dat` - Level-1 cluster centers
+2. `fine_codebook.dat` - Level-2 cluster centers  
+3. `pq_codebook.dat` - Product quantization codebook
+4. `index.dat` - Configuration metadata
+
+---
+
+#### Phase 2: ⚠️ PARTIAL - Index Building (CreateIndexFromTemplate)
+
+**Location:** `jni/src/puck_wrapper.cpp` lines 525-719
+
+**Current Status:** Basic structure exists but missing critical Puck operations
+
+**What's Implemented:**
+```cpp
+void CreateIndexFromTemplate(...) {
+    // ✅ Deserialize trained model from templateIndexJ
+    size_t offset = 0;
+    int32_t numFiles = readInt32(templateBytesJ + offset);
+    for (int i = 0; i < numFiles; i++) {
+        // Read filename, size, and write to tempDir
+    }
+    
+    // ✅ Write vectors in fvecs format
+    std::ofstream vecOut(vectorsFile, std::ios::binary);
+    for (int i = 0; i < numVectors; i++) {
+        int32_t dimension = dim;
+        vecOut.write((char*)&dimension, sizeof(int32_t));
+        const float* vec = inputVectors->data() + (i * dim);
+        vecOut.write((char*)vec, dim * sizeof(float));
+    }
+    
+    // ⚠️ STUB: Should initialize PuckIndex here
+    // ⚠️ STUB: Should call puckIndex->init_single_build() or batch_assign()
+    // ⚠️ STUB: Should quantize vectors with PQ
+}
+```
+
+**What NEEDS to be Added:**
+```cpp
+void CreateIndexFromTemplate(...) {
+    // ... after deserializing trained model ...
+    
+    // ❌ TODO: Initialize PuckIndex with trained codebooks
+    google::SetCommandLineOption("index_path", tempDir.c_str());
+    auto puckIndex = std::make_unique<puck::PuckIndex>();
+    puckIndex->init_single_build(); // Loads codebooks
+    
+    // ❌ TODO: Assign vectors to cells
+    std::vector<uint32_t> cellAssignments(numVectors);
+    for (int i = 0; i < numVectors; i++) {
+        puck::BuildInfo buildInfo;
+        buildInfo.feature.assign(
+            inputVectors->data() + i * dim,
+            inputVectors->data() + (i + 1) * dim
+        );
+        puckIndex->single_build(&buildInfo);
+        cellAssignments[i] = buildInfo.nearest_cell.cell_id;
+    }
+    
+    // ❌ TODO: Quantize vectors
+    std::vector<uint8_t> pqCodes(numVectors * pqM);
+    // Apply PQ encoding using puckIndex->_pq_quantization
+    
+    // ❌ TODO: Serialize complete index
+    // - Metadata (dimension, numVectors, coarse/fine clusters, nsq)
+    // - Codebooks (already have from templateIndexJ)
+    // - Cell assignments
+    // - PQ codes (or full vectors if !whether_pq)
+    // - IDs mapping
+}
+```
+
+**Why This is Complex:**
+1. Puck expects files on disk, not in-memory structures
+2. Need to coordinate between file-based and memory-based operations
+3. PQ encoding requires accessing Puck's internal quantization objects
+4. Final index format must match what LoadIndex expects
+
+---
+
+#### Phase 3: ❌ NOT IMPLEMENTED - Index Loading
+
+**Location:** `jni/src/puck_wrapper.cpp` lines 245-303
+
+**What NEEDS to be Implemented:**
+```cpp
+jlong LoadIndex(JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) {
+    // 1. Read index structure from stream
+    NativeEngineIndexInputMediator mediator(jniUtil, env, input);
+    PuckOpenSearchIOReader reader(&mediator);
+    
+    // Read header
+    uint32_t magic = reader.readUInt(); // 0x5055434B 'PUCK'
+    uint32_t version = reader.readUInt();
+    
+    // Read metadata
+    uint32_t dimension = reader.readUInt();
+    uint32_t numVectors = reader.readUInt();
+    uint32_t coarseClusters = reader.readUInt();
+    uint32_t fineClusters = reader.readUInt();
+    uint32_t nsq = reader.readUInt();
+    bool whetherPq = reader.readByte();
+    
+    // 2. Read codebooks
+    std::vector<float> coarseCodebook(coarseClusters * dimension);
+    reader.read(coarseCodebook.data(), ...);
+    
+    std::vector<float> fineCodebook(fineClusters * dimension);
+    reader.read(fineCodebook.data(), ...);
+    
+    std::vector<float> pqCodebook(...);
+    reader.read(pqCodebook.data(), ...);
+    
+    // 3. Read index data
+    std::vector<uint32_t> cellAssignments(numVectors);
+    reader.read(cellAssignments.data(), ...);
+    
+    std::vector<uint8_t> pqCodes(numVectors * nsq);
+    reader.read(pqCodes.data(), ...);
+    
+    std::vector<int> ids(numVectors);
+    reader.read(ids.data(), ...);
+    
+    // 4. Create temporary directory for codebooks
+    std::string tempDir = "/tmp/puck_load_" + std::to_string(time(nullptr));
+    mkdir(tempDir.c_str(), 0700);
+    
+    // Write codebooks to temp files
+    writeCodebookFile(tempDir + "/coarse_codebook.dat", coarseCodebook);
+    writeCodebookFile(tempDir + "/fine_codebook.dat", fineCodebook);
+    writeCodebookFile(tempDir + "/pq_codebook.dat", pqCodebook);
+    
+    // 5. Configure and initialize PuckIndex
+    google::SetCommandLineOption("index_path", tempDir.c_str());
+    google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
+    google::SetCommandLineOption("coarse_cluster_count", std::to_string(coarseClusters).c_str());
+    google::SetCommandLineOption("fine_cluster_count", std::to_string(fineClusters).c_str());
+    google::SetCommandLineOption("nsq", std::to_string(nsq).c_str());
+    
+    auto puckIndex = std::make_unique<puck::PuckIndex>();
+    puckIndex->init(); // Loads codebooks from temp files
+    
+    // 6. Load cell assignments and PQ data into index
+    // Copy cellAssignments → puckIndex->_memory_to_local
+    // Copy pqCodes → puckIndex's PQ data structures
+    
+    // 7. Initialize search context pool
+    puckIndex->init_context_pool();
+    
+    // 8. Cleanup temp directory (but keep index in memory!)
+    ::system(("rm -rf " + tempDir).c_str());
+    
+    return reinterpret_cast<jlong>(puckIndex.release());
+}
+```
+
+---
+
+#### Phase 4: ❌ NOT IMPLEMENTED - Search
+
+**Location:** `jni/src/puck_wrapper.cpp` lines 94-130
+
+**What NEEDS to be Implemented:**
+```cpp
+int knn_query_index(jlong indexPointer, jfloat* queryVector, jint dimension, jint k,
+                    const std::unordered_map<std::string, jobject>& parameters,
+                    jfloat* distances, jlong* indices) {
+    
+    // 1. Get index from pointer
+    auto* puckIndex = reinterpret_cast<puck::PuckIndex*>(indexPointer);
+    if (!puckIndex) {
+        throw std::runtime_error("Invalid index pointer");
+    }
+    
+    // 2. Create Puck Request
+    puck::Request request;
+    request.feature = queryVector;
+    request.topk = k;
+    
+    // Optional: extract search parameters
+    // search_coarse_count, neighbors_count, filter_topk
+    
+    // 3. Create Response
+    puck::Response response;
+    std::vector<float> responseDistances(k);
+    std::vector<uint32_t> responseIndices(k);
+    response.distance = responseDistances.data();
+    response.local_idx = responseIndices.data();
+    
+    // 4. Execute search
+    int ret = puckIndex->search(&request, &response);
+    if (ret != 0) {
+        throw std::runtime_error("Puck search failed with code: " + std::to_string(ret));
+    }
+    
+    // 5. Copy results
+    int resultCount = std::min(k, static_cast<jint>(response.result_num));
+    for (int i = 0; i < resultCount; i++) {
+        distances[i] = response.distance[i];
+        
+        // IMPORTANT: Map internal memory index → original doc ID
+        // Need to maintain this mapping in LoadIndex
+        indices[i] = mapMemoryIdxToDocId(response.local_idx[i]);
+    }
+    
+    return resultCount;
+}
+```
+
+---
+
+### Index Serialization Format (Proposed)
+
+For phases 2-4 to work together, we need a consistent serialization format:
+
+```
+=== HEADER ===
+[0x5055434B]      Magic number 'PUCK' (uint32)
+[1]               Version (uint32)
+[metadata_size]   Size of metadata block (uint32)
+
+=== METADATA ===
+[dimension]       Vector dimension (uint32)
+[num_vectors]     Number of indexed vectors (uint32)
+[coarse_clusters] Number of coarse clusters (uint32)
+[fine_clusters]   Number of fine clusters (uint32)
+[nsq]             PQ subvector count (uint32)
+[ks]              PQ centers per subvector (uint32)
+[whether_pq]      Use PQ compression (bool)
+[whether_norm]    Normalize vectors (bool)
+
+=== CODEBOOKS ===
+[coarse_size]     Size in bytes (uint64)
+[coarse_data]     Coarse codebook data (coarse_clusters × dimension × float)
+
+[fine_size]       Size in bytes (uint64)
+[fine_data]       Fine codebook data (fine_clusters × dimension × float)
+
+[pq_size]         Size in bytes (uint64)
+[pq_data]         PQ codebook data (nsq × ks × lsq × float)
+                  where lsq = dimension / nsq
+
+=== INDEX DATA ===
+[assign_size]     Size in bytes (uint64)
+[cell_assign]     Cell assignments (num_vectors × uint32)
+                  cell_id = coarse_id × fine_clusters + fine_id
+
+[pq_codes_size]   Size in bytes (uint64)
+[pq_codes]        PQ codes (num_vectors × nsq × uint8)
+                  OR full vectors if !whether_pq
+
+=== ID MAPPING ===
+[ids_size]        Size in bytes (uint64)
+[ids]             Document IDs (num_vectors × int32)
+```
+
+**Total Size Estimate:**
+- 100K vectors, 128D, nsq=8:
+  - Metadata: ~100 bytes
+  - Codebooks: ~1 MB
+  - Cell assignments: 400 KB
+  - PQ codes: 800 KB (vs 51 MB for full vectors!)
+  - IDs: 400 KB
+  - **Total: ~2.6 MB** (vs ~52 MB uncompressed)
+
+---
+
+### Implementation Priorities
+
+Based on the analysis above, here's the recommended implementation order:
+
+1. **Phase 2 - Complete CreateIndexFromTemplate** (HIGH PRIORITY)
+   - **Why first:** Training is done, need this to actually use trained models
+   - **Effort:** 6-8 hours
+   - **Complexity:** Medium-High (needs deep Puck integration)
+
+2. **Phase 3 - Implement LoadIndex** (HIGH PRIORITY)
+   - **Why second:** Needed to load indices for search
+   - **Effort:** 4-6 hours
+   - **Complexity:** Medium (format definition + deserialization)
+   - **Dependency:** Requires CreateIndexFromTemplate format
+
+3. **Phase 4 - Implement Search** (HIGH PRIORITY)
+   - **Why third:** Final piece to make everything work
+   - **Effort:** 3-4 hours
+   - **Complexity:** Medium (mostly calling Puck's search API)
+   - **Dependency:** Requires LoadIndex
+
+4. **Integration Testing** (CRITICAL)
+   - End-to-end workflow test
+   - Memory leak testing
+   - Performance benchmarking
+   - Accuracy validation vs brute-force
+
+---
+
+### Technical Challenges & Solutions
+
+#### Challenge 1: Puck's Protected _conf Member
+**Problem:** Can't directly set `puckIndex->_conf` fields (protected)
+**Current Solution:** Use gflags before construction
+```cpp
+google::SetCommandLineOption("feature_dim", "128");
+auto idx = new puck::PuckIndex(); // Constructor reads FLAGS
+```
+
+**Alternative:** Create accessor wrapper
+```cpp
+class OpenSearchPuckIndex : public puck::PuckIndex {
+public:
+    void setDimension(int dim) { _conf.feature_dim = dim; }
+};
+```
+
+#### Challenge 2: File vs Memory Operations
+**Problem:** Puck designed for files, OpenSearch uses streams
+**Solution:** Temporary directory bridge
+- Training: tempDir → files → serialize → byte array
+- Building: byte array → tempDir → files → build → serialize
+- Loading: byte array → tempDir → init → cleanup tempDir
+
+#### Challenge 3: ID Mapping
+**Problem:** Puck uses internal memory indices, need doc IDs
+**Solution:** Maintain dual mapping
+```cpp
+struct IndexMetadata {
+    std::vector<int32_t> memoryIdxToDocId; // For search results
+    std::unordered_map<int32_t, uint32_t> docIdToMemoryIdx; // For updates
+};
+```
+
+---
+
+### Next Implementation Steps
+
+**Step 1: Define Index Format** (1-2 hours)
+- Finalize serialization format (see proposed format above)
+- Create helper functions for reading/writing
+
+**Step 2: Complete CreateIndexFromTemplate** (4-6 hours)
+```cpp
+// TODO items:
+// 1. Initialize PuckIndex with loaded codebooks
+// 2. Implement single_build() loop for cell assignment
+// 3. Encode vectors with PQ
+// 4. Serialize to defined format
+// 5. Test with small dataset
+```
+
+**Step 3: Implement LoadIndex** (3-4 hours)
+```cpp
+// TODO items:
+// 1. Read from defined format
+// 2. Write codebooks to temp files
+// 3. Initialize PuckIndex
+// 4. Load data structures
+// 5. Test round-trip (save → load)
+```
+
+**Step 4: Implement Search** (2-3 hours)
+```cpp
+// TODO items:
+// 1. Create Request/Response
+// 2. Call puckIndex->search()
+// 3. Map results to doc IDs
+// 4. Test search accuracy
+```
+
+**Step 5: Integration Test** (4-6 hours)
+- Full workflow: train → build → load → search
+- Verify results vs brute-force
+- Check memory usage
+- Benchmark performance
+
+---
+
+## Current Implementation Status (2025-10-08 23:30)
+
+### ✅ DONE - Training Config Validation
+- PuckHierarchicalMethod.doGetTrainingConfigValidationSetup() is fully implemented
+- Validates pq_m divides dimension evenly
+- Validates minimum training vectors (10x coarse_clusters, min 1000)
+- Build successful, validation works
+
+### ✅ DONE - CreateIndexFromTemplate (lines 551-771)
+- ✅ Deserializes trained model byte array to temp files
+- ✅ Writes input vectors in fvecs format
+- ✅ Calls init_single_build() to load codebooks
+- ✅ Uses single_build() loop to assign vectors to cells
+- ✅ Serializes index with proper format:
+  - Header (magic, version)
+  - Metadata (dimension, numVectors)
+  - ID mapping
+  - Vectors (full precision, PQ to be added later)
+  - Cell assignments
+  - Trained model files (codebooks)
+
+### ✅ DONE - LoadIndex (lines 247-366)
+- ✅ Reads index format (header, metadata, IDs, vectors, cell assignments, model files)
+- ✅ Deserializes model files to temp directory
+- ✅ Initializes HierarchicalClusterIndex with trained codebooks
+- ✅ Stores everything in IndexMetadata structure
+- ✅ Returns pointer to IndexMetadata
+
+### ✅ DONE - Search (lines 110-162)
+- ✅ Gets IndexMetadata from pointer
+- ✅ Creates Puck Request/Response
+- ✅ Calls puckIndex->search()
+- ✅ Maps memory indices → document IDs
+- ✅ Returns results with proper ID mapping
+
+---
+
+*Last Updated: 2025-10-08 23:30*
+*Status: All 4 phases complete - Training, CreateIndexFromTemplate, LoadIndex, Search ✅*
+*Next: Build and test end-to-end workflow*

@@ -19,8 +19,8 @@
       <url>https://github.com/opensearch-project/k-NN</url>
     </developer>
   </developers>
-  <url>https://github.com/opensearch-project/k-NN.git</url>
+  <url>https://github.com/caokyhieu/k-nn-puck.git</url>
   <scm>
-    <url>https://github.com/opensearch-project/k-NN.git</url>
+    <url>https://github.com/caokyhieu/k-nn-puck.git</url>
   </scm>
 </project>
