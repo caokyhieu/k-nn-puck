@@ -10,6 +10,7 @@
 
 #include "puck_wrapper.h"
 #include "jni_util.h"
+#include <memory>
 
 static knn_jni::JNIUtil jniUtil;
 
