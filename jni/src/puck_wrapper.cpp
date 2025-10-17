@@ -22,6 +22,12 @@
 #include "puck/puck/puck_index.h"
 #include "puck/gflags/puck_gflags.h"
 #include "puck/search_context.h"
+#include <glog/logging.h>
+
+jint JNI_OnLoad(JavaVM* vm, void*) {
+    google::InitGoogleLogging("opensearchknn_puck");
+    return JNI_VERSION_1_8;
+}
 
 namespace {
     std::string createUniqueTempDir(const std::string& prefix) {
@@ -36,6 +42,7 @@ namespace {
         
         return std::string(result);
     }
+
 
     puck::IndexConf readIndexConf(const std::string& indexDatPath) {
         std::ifstream file(indexDatPath, std::ios::binary);
@@ -93,6 +100,20 @@ public:
     void public_set_conf(const puck::IndexConf& conf) {
         _conf = conf;
     }
+
+    void directSetConf(const puck::IndexConf &conf, const std::string &tempDir) {
+        _conf = conf;
+        _conf.index_path = tempDir;
+        _conf.coarse_codebook_file_name = tempDir + "/coarse_codebook.dat";
+        _conf.fine_codebook_file_name   = tempDir + "/fine_codebook.dat";
+        _conf.filter_codebook_file_name = tempDir + "/filter_codebook.dat";
+        _conf.filter_data_file_name     = tempDir + "/filter_data.dat";
+        _conf.pq_codebook_file_name     = tempDir + "/pq_codebook.dat";
+        _conf.pq_data_file_name         = tempDir + "/pq_data.dat";
+        _conf.cell_assign_file_name     = tempDir + "/cell_assign.dat";
+        _conf.index_file_name           = tempDir + "/index.dat";
+    }
+
     
     int public_init_model_memory() {
         return init_model_memory();
@@ -101,6 +122,8 @@ public:
     int public_read_coodbooks() {
         return read_coodbooks();
     }
+
+
     
     int public_convert_local_to_memory_idx(uint32_t* cell_start_memory_idx, 
                                            uint32_t* local_to_memory_idx) {
@@ -123,6 +146,8 @@ public:
 namespace knn_jni {
 namespace puck_wrapper {
 
+#define PUCK_LOG(msg) std::cout << "[PUCK JNI] " << msg << std::endl;
+
 struct IndexMetadata {
     std::vector<int> ids;
     std::vector<float> vectors;
@@ -131,10 +156,9 @@ struct IndexMetadata {
     uint32_t numVectors;
     std::unique_ptr<PuckIndexWrapper> puckIndex;
     puck::IndexConf indexConf;
-    std::string tempDir;  // ✅ ADD THIS
+    std::string tempDir;  // Temp dir to clean up
 
     ~IndexMetadata() {
-        // Clean up temp directory
         if (!tempDir.empty()) {
             ::system(("rm -rf " + tempDir).c_str());
         }
@@ -564,257 +588,402 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
 }
 
 
-// LoadIndex
+// Full corrected LoadIndex
 jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) {
     if (input == nullptr) {
-        throw std::runtime_error("IndexInput cannot be null");
+        jniUtil->ThrowJavaException(env, "java/lang/NullPointerException", "IndexInput is null");
+        return 0;
     }
 
+    std::string tempDir;
     try {
         stream::NativeEngineIndexInputMediator mediator(jniUtil, env, input);
-        puck_stream::PuckOpenSearchIOReader reader(&mediator);
 
-        uint32_t magic, version, dimension, numVectors;
+        // Read header
+        uint32_t magic = 0;
         mediator.copyBytes(sizeof(magic), reinterpret_cast<uint8_t*>(&magic));
-        if (magic != 0x5055434B) {
+        const uint32_t EXPECTED_MAGIC = 0x5055434B;
+        if (magic != EXPECTED_MAGIC) {
             throw std::runtime_error("Invalid Puck index format (bad magic)");
         }
 
+        uint32_t version;
         mediator.copyBytes(sizeof(version), reinterpret_cast<uint8_t*>(&version));
+        // Optionally validate version
+
+        uint32_t dimension, numVectors;
         mediator.copyBytes(sizeof(dimension), reinterpret_cast<uint8_t*>(&dimension));
         mediator.copyBytes(sizeof(numVectors), reinterpret_cast<uint8_t*>(&numVectors));
 
-        std::cerr << "[Puck] Loading index: " << numVectors << " vectors, dim=" << dimension << std::endl;
+        LOG(INFO) << "[Puck] Loading index: " << numVectors << " vectors, dim=" << dimension;
 
+        // Read IDs, raw vectors, cell assignments
         std::vector<int> ids(numVectors);
-        mediator.copyBytes(numVectors * sizeof(int), reinterpret_cast<uint8_t*>(ids.data()));
+        mediator.copyBytes(numVectors * sizeof(int),
+                           reinterpret_cast<uint8_t*>(ids.data()));
 
         std::vector<float> vectors(numVectors * dimension);
-        mediator.copyBytes(numVectors * dimension * sizeof(float), 
-                         reinterpret_cast<uint8_t*>(vectors.data()));
+        mediator.copyBytes(numVectors * dimension * sizeof(float),
+                           reinterpret_cast<uint8_t*>(vectors.data()));
 
         std::vector<uint32_t> cellAssignments(numVectors);
-        mediator.copyBytes(numVectors * sizeof(uint32_t), 
-                         reinterpret_cast<uint8_t*>(cellAssignments.data()));
+        mediator.copyBytes(numVectors * sizeof(uint32_t),
+                           reinterpret_cast<uint8_t*>(cellAssignments.data()));
 
-        int32_t numAllFiles;
-        mediator.copyBytes(sizeof(numAllFiles), reinterpret_cast<uint8_t*>(&numAllFiles));
-
-        std::string tempDir = createUniqueTempDir("puck_load");
-
-        try {
-            std::cerr << "[Puck Load] Using temp directory: " << tempDir << std::endl;
-            std::cerr << "[Puck] Extracting " << numAllFiles << " files..." << std::endl;
-            
-            for (int32_t i = 0; i < numAllFiles; i++) {
-                int32_t nameLen;
-                mediator.copyBytes(sizeof(nameLen), reinterpret_cast<uint8_t*>(&nameLen));
-
-                std::vector<char> nameBuffer(nameLen + 1, '\0');
-                mediator.copyBytes(nameLen, reinterpret_cast<uint8_t*>(nameBuffer.data()));
-                std::string filename(nameBuffer.data(), nameLen);
-
-                int64_t fileSize;
-                mediator.copyBytes(sizeof(fileSize), reinterpret_cast<uint8_t*>(&fileSize));
-
-                std::vector<char> fileBuffer(fileSize);
-                mediator.copyBytes(fileSize, reinterpret_cast<uint8_t*>(fileBuffer.data()));
-
-                std::string filepath = tempDir + "/" + filename;
-                std::ofstream outFile(filepath, std::ios::binary);
-                outFile.write(fileBuffer.data(), fileSize);
-                outFile.close();
-                
-                std::cerr << "[Puck]   - " << filename << " (" << fileSize << " bytes)" << std::endl;
-            }
-
-            // ✅ Verify cell_assign.dat exists with correct size
-            std::string cellAssignPath = tempDir + "/cell_assign.dat";
-            struct stat cellStat;
-            if (stat(cellAssignPath.c_str(), &cellStat) != 0) {
-                throw std::runtime_error("cell_assign.dat not found at: " + cellAssignPath);
-            }
-            size_t expectedCellSize = numVectors * sizeof(uint32_t);
-            if (cellStat.st_size != expectedCellSize) {
-                std::cerr << "[Puck ERROR] cell_assign.dat size: " << cellStat.st_size 
-                         << ", expected: " << expectedCellSize << std::endl;
-                throw std::runtime_error("cell_assign.dat size mismatch");
-            }
-            std::cerr << "[Puck] Verified cell_assign.dat: " << cellStat.st_size << " bytes" << std::endl;
-
-            // Read config
-            std::string indexDatPath = tempDir + "/index.dat";
-            puck::IndexConf conf = readIndexConf(indexDatPath);
-            conf.total_point_count = numVectors;
-            conf.feature_dim = dimension;
-
-            std::cerr << "[Puck] Config: coarse=" << conf.coarse_cluster_count 
-                     << ", fine=" << conf.fine_cluster_count 
-                     << ", filter_nsq=" << conf.filter_nsq 
-                     << ", nsq=" << conf.nsq << std::endl;
-
-            // ✅ CRITICAL: Set gflags BEFORE creating PuckIndex
-            google::SetCommandLineOption("index_path", tempDir.c_str());
-            google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
-            google::SetCommandLineOption("total_point_count", std::to_string(numVectors).c_str());
-            
-            // Set all filename flags
-            google::SetCommandLineOption("cell_assign_file_name", "cell_assign.dat");
-            google::SetCommandLineOption("filter_data_file_name", "filter_data.dat");
-            google::SetCommandLineOption("pq_data_file_name", "pq_data.dat");
-            google::SetCommandLineOption("coarse_codebook_file_name", "coarse_codebook.dat");
-            google::SetCommandLineOption("fine_codebook_file_name", "fine_codebook.dat");
-            google::SetCommandLineOption("filter_codebook_file_name", "filter_codebook.dat");
-            google::SetCommandLineOption("pq_codebook_file_name", "pq_codebook.dat");
-            google::SetCommandLineOption("index_file_name", "index.dat");
-            
-            // Set config parameters
-            google::SetCommandLineOption("coarse_cluster_count", std::to_string(conf.coarse_cluster_count).c_str());
-            google::SetCommandLineOption("fine_cluster_count", std::to_string(conf.fine_cluster_count).c_str());
-            google::SetCommandLineOption("whether_filter", conf.whether_filter ? "true" : "false");
-            google::SetCommandLineOption("filter_nsq", std::to_string(conf.filter_nsq).c_str());
-            google::SetCommandLineOption("whether_pq", conf.whether_pq ? "true" : "false");
-            google::SetCommandLineOption("nsq", std::to_string(conf.nsq).c_str());
-            google::SetCommandLineOption("ks", std::to_string(conf.ks).c_str());
-
-            // ✅ Verify gflag was set
-            std::string verifyPath;
-            google::GetCommandLineOption("index_path", &verifyPath);
-            std::cerr << "[Puck] Verified index_path gflag: " << verifyPath << std::endl;
-            
-            if (verifyPath != tempDir) {
-                throw std::runtime_error("gflag index_path mismatch: set=" + tempDir + ", got=" + verifyPath);
-            }
-
-            std::cerr << "[Puck] Creating PuckIndex..." << std::endl;
-            auto index = std::make_unique<PuckIndexWrapper>();
-            index->public_set_conf(conf);
-            
-            std::cerr << "[Puck] Initializing model memory..." << std::endl;
-            if (index->public_init_model_memory() != 0) {
-                throw std::runtime_error("Failed to initialize model memory");
-            }
-            
-            std::cerr << "[Puck] Reading codebooks from: " << tempDir << std::endl;
-            if (index->public_read_coodbooks() != 0) {
-                throw std::runtime_error("Failed to read codebooks");
-            }
-
-            std::cerr << "[Puck] Building memory mappings (will read from " << tempDir << ")..." << std::endl;
-            std::unique_ptr<uint32_t[]> cellStartMemoryIdx(
-                new uint32_t[conf.coarse_cluster_count * conf.fine_cluster_count + 1]
-            );
-            std::unique_ptr<uint32_t[]> localToMemoryIdx(new uint32_t[numVectors]);
-            
-            int convertResult = index->public_convert_local_to_memory_idx(
-                cellStartMemoryIdx.get(), 
-                localToMemoryIdx.get()
-            );
-            
-            if (convertResult != 0) {
-                std::cerr << "[Puck ERROR] convert_local_to_memory_idx failed with code: " << convertResult << std::endl;
-                std::cerr << "[Puck ERROR] Current gflag index_path: " << verifyPath << std::endl;
-                std::cerr << "[Puck ERROR] Expected path: " << tempDir << std::endl;
-                throw std::runtime_error("Failed to convert indices");
-            }
-            
-            std::cerr << "[Puck] Loading quantization features..." << std::endl;
-            int readResult = index->public_read_feature_index(localToMemoryIdx.get());
-            
-            if (readResult != 0) {
-                throw std::runtime_error("Failed to read feature index");
-            }
-
-            auto* wrapper = new IndexMetadata();
-            wrapper->ids = std::move(ids);
-            wrapper->vectors = std::move(vectors);
-            wrapper->cellAssignments = std::move(cellAssignments);
-            wrapper->puckIndex = std::move(index);
-            wrapper->indexConf = conf;
-            wrapper->dimension = dimension;
-            wrapper->numVectors = numVectors;
-
-            ::system(("rm -rf " + tempDir).c_str());
-
-            std::cerr << "[Puck] Index loaded successfully!" << std::endl;
-            return reinterpret_cast<jlong>(wrapper);
-
-        } catch (...) {
-            ::system(("rm -rf " + tempDir).c_str());
-            throw;
+        // Read number of files
+        int32_t numAllFiles = 0;
+        mediator.copyBytes(sizeof(int32_t),
+                           reinterpret_cast<uint8_t*>(&numAllFiles));
+        if (numAllFiles <= 0) {
+            throw std::runtime_error("Invalid file count in serialized index");
         }
 
-    } catch (const std::exception& e) {
-        std::cerr << "[Puck ERROR] LoadIndex failed: " << e.what() << std::endl;
-        throw std::runtime_error("LoadIndex failed: " + std::string(e.what()));
+        // Create a temp directory for extraction
+        tempDir = createUniqueTempDir("puck_load");
+
+        // Extract model files
+        std::vector<std::string> filenames;
+        filenames.reserve(numAllFiles);
+        for (int i = 0; i < numAllFiles; i++) {
+            int32_t nameLen = 0;
+            mediator.copyBytes(sizeof(nameLen),
+                               reinterpret_cast<uint8_t*>(&nameLen));
+            if (nameLen <= 0 || nameLen > 1024) {
+                throw std::runtime_error("Invalid filename length " + std::to_string(nameLen));
+            }
+            std::vector<char> nameBuf(nameLen);
+            mediator.copyBytes(nameLen,
+                               reinterpret_cast<uint8_t*>(nameBuf.data()));
+            std::string fname(nameBuf.begin(), nameBuf.end());
+
+            int64_t fileSize = 0;
+            mediator.copyBytes(sizeof(fileSize),
+                               reinterpret_cast<uint8_t*>(&fileSize));
+            if (fileSize < 0) {
+                throw std::runtime_error("Invalid file size for " + fname);
+            }
+
+            std::vector<char> fileBuf(fileSize);
+            if (fileSize > 0) {
+                mediator.copyBytes(fileSize,
+                                   reinterpret_cast<uint8_t*>(fileBuf.data()));
+            }
+
+            std::string filepath = tempDir + "/" + fname;
+            std::ofstream of(filepath, std::ios::binary);
+            of.write(fileBuf.data(), fileBuf.size());
+            of.close();
+
+            filenames.push_back(fname);
+            LOG(INFO) << "[Puck]   - Extracted " << fname << " (" << fileSize << " bytes)";
+        }
+
+        // Now we must read config (index.dat) so we know filter_nsq, nsq, cluster counts, etc.
+        std::string indexDatPath = tempDir + "/index.dat";
+        puck::IndexConf conf = readIndexConf(indexDatPath);
+        // Override conf.number_of_vectors from serialized data
+        conf.feature_dim = dimension;
+        conf.total_point_count = numVectors;
+
+        LOG(INFO) << "[Puck] Config loaded: coarse=" << conf.coarse_cluster_count
+                  << " fine=" << conf.fine_cluster_count
+                  << " filter_nsq=" << conf.filter_nsq
+                  << " nsq=" << conf.nsq
+                  << " whether_filter=" << conf.whether_filter
+                  << " whether_pq=" << conf.whether_pq;
+
+        // IMPORTANT: set all gflags *before* creating/initializing the PuckIndex
+        google::SetCommandLineOption("index_path", tempDir.c_str());
+        google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
+        google::SetCommandLineOption("total_point_count", std::to_string(numVectors).c_str());
+        google::SetCommandLineOption("coarse_cluster_count", std::to_string(conf.coarse_cluster_count).c_str());
+        google::SetCommandLineOption("fine_cluster_count", std::to_string(conf.fine_cluster_count).c_str());
+        google::SetCommandLineOption("whether_filter", (conf.whether_filter ? "true" : "false"));
+        google::SetCommandLineOption("filter_nsq", std::to_string(conf.filter_nsq).c_str());
+        google::SetCommandLineOption("whether_pq", (conf.whether_pq ? "true" : "false"));
+        google::SetCommandLineOption("nsq", std::to_string(conf.nsq).c_str());
+        google::SetCommandLineOption("ks", std::to_string(conf.ks).c_str());
+        // Also set file names flags if needed (optional, if consistent with build)
+        // e.g. coarse_codebook_file_name, etc.
+
+        // Sanity-check: ensure that index_path gflag was set correctly
+        std::string verifyIndexPath;
+        google::GetCommandLineOption("index_path", &verifyIndexPath);
+        if (verifyIndexPath != tempDir) {
+            throw std::runtime_error("gflag index_path mismatch: set " + tempDir + " got " + verifyIndexPath);
+        }
+
+        // Instantiate PuckIndex and load into memory
+        auto index = std::make_unique<PuckIndexWrapper>();
+        index->directSetConf(conf, tempDir);
+
+   
+        // Initialize model memory
+        if (index->public_init_model_memory() != 0) {
+            throw std::runtime_error("init_model_memory failed");
+        }
+
+        // Load codebooks / quantization tables
+        if (index->public_read_coodbooks() != 0) {
+            throw std::runtime_error("read_codebooks failed");
+        }
+
+        // Set up memory indexing
+        auto coarseCount = conf.coarse_cluster_count * conf.fine_cluster_count;
+        std::unique_ptr<uint32_t[]> cellStartMemoryIdx(new uint32_t[coarseCount + 1]);
+        std::unique_ptr<uint32_t[]> localToMemoryIdx(new uint32_t[numVectors]);
+
+        // int conv = index->public_convert_local_to_memory_idx(cellStartMemoryIdx.get(), localToMemoryIdx.get());
+        // if (conv != 0) {
+        //     throw std::runtime_error("convert_local_to_memory_idx failed (code " + std::to_string(conv) + ")");
+        // }
+        // auto coarseCount = conf.coarse_cluster_count * conf.fine_cluster_count;
+        // std::unique_ptr<uint32_t[]> cell_start_memory_idx(new uint32_t[coarseCount + 1]);
+        // std::unique_ptr<uint32_t[]> local_to_memory_idx(new uint32_t[numVectors]);
+        for (uint32_t i = 0; i < numVectors; i++) {
+            localToMemoryIdx[i] = i;  // Identity mapping
+        }
+
+        // Build cell_start_memory_idx from cellAssignments
+        std::vector<uint32_t> cell_counts(coarseCount, 0);
+        for (uint32_t i = 0; i < numVectors; i++) {
+            cell_counts[cellAssignments[i]]++;
+        }
+
+        cellStartMemoryIdx[0] = 0;
+        for (uint32_t i = 0; i < coarseCount; i++) {
+            cellStartMemoryIdx[i + 1] = cellStartMemoryIdx[i] + cell_counts[i];
+        }
+        
+        // Load quantization features (PQ / filter data)
+        if (index->public_read_feature_index(localToMemoryIdx.get()) != 0) {
+            throw std::runtime_error("read_feature_index failed");
+        }
+
+        // Wrap into metadata to return to Java
+        IndexMetadata *meta = new IndexMetadata();
+        meta->ids = std::move(ids);
+        meta->vectors = std::move(vectors);
+        meta->cellAssignments = std::move(cellAssignments);
+        meta->puckIndex = std::move(index);
+        meta->indexConf = conf;
+        meta->dimension = dimension;
+        meta->numVectors = numVectors;
+        meta->tempDir = tempDir;
+
+        LOG(INFO) << "[Puck] LoadIndex succeeded, returning native pointer";
+        return reinterpret_cast<jlong>(meta);
+
+    } catch (const std::exception &e) {
+        // Clean up tempDir if created
+        if (!tempDir.empty()) {
+            ::system(("rm -rf " + tempDir).c_str());
+        }
+        std::string msg = std::string("LoadIndex failed: ") + e.what();
+        jniUtil->ThrowJavaException(env, "java/lang/Exception", msg.c_str());
+        return 0;
     }
 }
 
-
-
-
-
-// Query
-int knn_query_index(jlong indexPointer, jfloat* queryVector, jint dimension, jint k,
-                    const std::unordered_map<std::string, jobject>& parameters,
-                    jfloat* distances, jlong* indices) {
-    
-    if (indexPointer == 0) {
-        throw std::invalid_argument("Index pointer is null");
+jobjectArray QueryIndex(
+    JNIUtilInterface* jniUtil,
+    JNIEnv* env,
+    jlong indexPointerJ,
+    jfloatArray queryVectorJ,
+    jint kJ,
+    jobject methodParamsJ,
+    jlongArray filterIdsJ,      // Can skip initially
+    jint filterIdsTypeJ     // ← Include but don't implement yet
+){
+    if (queryVectorJ == nullptr) {
+        throw std::runtime_error("Query Vector cannot be null");
     }
+    
+    auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointerJ);
+    if (!metadata || !metadata->puckIndex) {
+        throw std::runtime_error("Invalid index pointer");
+    }
+    
+    // Extract query vector
+    float* rawQueryVector = jniUtil->GetFloatArrayElements(env, queryVectorJ, nullptr);
+    int dimension = jniUtil->GetJavaFloatArrayLength(env, queryVectorJ);
+    
+    // Prepare buffers
+    std::vector<float> distances(kJ);
+    std::vector<uint32_t> localIndices(kJ);
+    
 
+
+    
     try {
-        auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointer);
-
-        puck::SearchContext searchContext;
-        puck::IndexConf& conf = metadata->indexConf;
+        // Normalize query (CRITICAL!)
+        std::vector<float> normalizedQuery(dimension);
+        float norm = cblas_snrm2(dimension, rawQueryVector, 1);
         
-        if (conf.topk < static_cast<uint32_t>(k)) {
-            conf.topk = k;
-        }
-
-        int resetResult = searchContext.reset(conf);
-        if (resetResult != 0) {
-            throw std::runtime_error("Failed to initialize SearchContext");
-        }
-
-        puck::Request request;
-        request.feature = queryVector;
-        request.topk = k;
-
-        puck::Response response;
-        std::vector<float> distancesVec(k);
-        std::vector<uint32_t> memoryIndices(k);
-        response.distance = distancesVec.data();
-        response.local_idx = memoryIndices.data();
-        response.result_num = 0;
-
-        int searchResult = metadata->puckIndex->public_search(&request, &response);
-
-        if (searchResult != 0) {
-            throw std::runtime_error("Search failed: " + std::to_string(searchResult));
-        }
-
-        int resultCount = std::min(k, static_cast<int>(response.result_num));
-        
-        for (int i = 0; i < resultCount; i++) {
-            uint32_t memIdx = response.local_idx[i];
-            
-            if (memIdx >= metadata->ids.size()) {
-                throw std::runtime_error("Invalid memory index");
+        if (norm > 1e-6) {
+            float invNorm = 1.0f / norm;
+            for (int i = 0; i < dimension; i++) {
+                normalizedQuery[i] = rawQueryVector[i] * invNorm;
             }
-
-            distances[i] = response.distance[i];
-            indices[i] = static_cast<jlong>(metadata->ids[memIdx]);
+        } else {
+            std::copy(rawQueryVector, rawQueryVector + dimension, normalizedQuery.begin());
         }
-
-        return resultCount;
-
-    } catch (const std::exception& e) {
-        std::cerr << "[Puck Query ERROR] " << e.what() << std::endl;
+        
+        // Prepare request
+        puck::Request request;
+        request.feature = normalizedQuery.data();
+        request.topk = kJ;
+        
+        puck::Response response;
+        response.distance = distances.data();
+        response.local_idx = localIndices.data();
+        response.result_num = 0;
+        
+        // Use search() not public_search()
+        int result = metadata->puckIndex->search(&request, &response);
+        
+        if (result != 0) {
+            throw std::runtime_error("Search failed: " + std::to_string(result));
+        }
+        
+        int resultSize = std::min(kJ, static_cast<int>(response.result_num));
+        
+        // Create Java result array (FAISS style)
+        jclass resultClass = jniUtil->FindClass(env, "org/opensearch/knn/index/query/KNNQueryResult");
+        jmethodID constructor = jniUtil->FindMethod(env, "org/opensearch/knn/index/query/KNNQueryResult", "<init>");
+        jobjectArray results = jniUtil->NewObjectArray(env, resultSize, resultClass, nullptr);
+        
+        for (int i = 0; i < resultSize; i++) {
+            uint32_t localIdx = response.local_idx[i];
+            if (localIdx >= metadata->ids.size()) {
+                throw std::runtime_error("Invalid local index");
+            }
+            
+            jlong docId = static_cast<jlong>(metadata->ids[localIdx]);
+            jfloat dist = distances[i];
+            
+            jobject resultObj = jniUtil->NewObject(env, resultClass, constructor, docId, dist);
+            jniUtil->SetObjectArrayElement(env, results, i, resultObj);
+        }
+        
+        jniUtil->ReleaseFloatArrayElements(env, queryVectorJ, rawQueryVector, JNI_ABORT);
+        return results;
+        
+    } catch (...) {
+        jniUtil->ReleaseFloatArrayElements(env, queryVectorJ, rawQueryVector, JNI_ABORT);
         throw;
     }
 }
+
+
+// Query
+int knn_query_index(jlong indexPointer, jfloat* queryVector, jint dimension, 
+                    jint k, const std::unordered_map<std::string, jobject>& parameters,
+                    jfloat* distances, jlong* indices) {
+    
+    LOG(INFO) << "=== PUCK QUERY START ===";
+    LOG(INFO) << "k=" << k << ", dim=" << dimension;
+    
+    if (indexPointer == 0) {
+        LOG(ERROR) << "Null index pointer";
+        return 0;
+    }
+
+    PUCK_LOG("---- KNN Query Start ----");
+    PUCK_LOG("Index pointer: " << indexPointer);
+    PUCK_LOG("Query dimension: " << dimension);
+    PUCK_LOG("k (neighbors): " << k);
+
+    try {
+        auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointer);
+        
+        if (!metadata->puckIndex) {
+            LOG(ERROR) << "PuckIndex is null";
+            return 0;
+        }
+        
+        LOG(INFO) << "Index has " << metadata->ids.size() << " documents";
+        
+        // Get configuration
+        puck::IndexConf& conf = metadata->puckIndex->get_index_conf();
+        
+        // Ensure topk is sufficient
+        if (conf.topk < static_cast<uint32_t>(k)) {
+            conf.topk = k;
+        }
+        
+        // Normalize query vector (critical!)
+        std::vector<float> normalizedQuery(dimension);
+        float norm = 0.0f;
+        for (int i = 0; i < dimension; i++) {
+            norm += queryVector[i] * queryVector[i];
+        }
+        norm = std::sqrt(norm);
+        
+        if (norm > 1e-6) {
+            for (int i = 0; i < dimension; i++) {
+                normalizedQuery[i] = queryVector[i] / norm;
+            }
+            LOG(INFO) << "Query normalized (norm=" << norm << ")";
+        } else {
+            LOG(WARNING) << "Zero norm query, copying as-is";
+            std::copy(queryVector, queryVector + dimension, normalizedQuery.begin());
+        }
+        
+        // Prepare request
+        puck::Request request;
+        request.feature = normalizedQuery.data();
+        request.topk = k;
+        
+        // Prepare response buffers
+        std::vector<float> distancesVec(k, std::numeric_limits<float>::max());
+        std::vector<uint32_t> localIndices(k, 0);
+        
+        puck::Response response;
+        response.distance = distancesVec.data();
+        response.local_idx = localIndices.data();
+        response.result_num = 0;
+        
+        LOG(INFO) << "Calling PuckIndex::search()";
+        
+        // Use the main search() method - it manages context pool internally
+        int searchResult = metadata->puckIndex->search(&request, &response);
+        
+        LOG(INFO) << "Search result: " << searchResult 
+                  << ", found: " << response.result_num;
+        
+        if (searchResult != 0) {
+            LOG(ERROR) << "Search failed: " << searchResult;
+            return 0;
+        }
+        
+        // Copy results
+        int resultCount = std::min(k, static_cast<int>(response.result_num));
+        
+        for (int i = 0; i < resultCount; i++) {
+            uint32_t localIdx = response.local_idx[i];
+            
+            if (localIdx >= metadata->ids.size()) {
+                LOG(ERROR) << "Invalid local index: " << localIdx;
+                return 0;
+            }
+            
+            distances[i] = response.distance[i];
+            indices[i] = static_cast<jlong>(metadata->ids[localIdx]);
+            
+            LOG(INFO) << "  [" << i << "] doc=" << indices[i] 
+                      << " dist=" << distances[i];
+        }
+        
+        LOG(INFO) << "=== PUCK QUERY END: " << resultCount << " results ===";
+        return resultCount;
+        
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Query exception: " << e.what();
+        return 0;
+    }
+}
+
 
 // Free index
 void knn_free_index(jlong indexPointer) {
