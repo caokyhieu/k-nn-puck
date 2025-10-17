@@ -81,6 +81,9 @@ int knn_query_index(jlong indexPointer, jfloat* queryVector, jint dimension, jin
  */
 void knn_free_index(jlong indexPointer);
 
+jobjectArray QueryIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jlong indexPointerJ,
+                                jfloatArray queryVectorJ, jint kJ, jobject methodParamsJ);
+
 // ========== DEPRECATED / STUB METHODS ==========
 // These throw exceptions - use the above methods instead
 
