@@ -76,70 +76,77 @@ JNIEXPORT jbyteArray JNICALL Java_org_opensearch_knn_jni_PuckService_trainIndex(
     return nullptr;
 }
 
-// Query index for k-nearest neighbors
-JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_PuckService_queryIndex(JNIEnv *env, jclass cls, jlong indexPointer, jfloatArray queryVector, jint k, jobject parameters) {
-    try {
-        if (indexPointer == 0) {
-            throw std::invalid_argument("Index pointer is null");
-        }
+// // Query index for k-nearest neighbors
+// JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_PuckService_queryIndex(JNIEnv *env, jclass cls, jlong indexPointer, jfloatArray queryVector, jint k, jobject parameters) {
+//     try {
+//         if (indexPointer == 0) {
+//             throw std::invalid_argument("Index pointer is null");
+//         }
 
-        // Get query vector from Java array
-        jfloat* query = env->GetFloatArrayElements(queryVector, nullptr);
-        if (query == nullptr) {
-            throw std::runtime_error("Failed to get query vector");
-        }
+//         // Get query vector from Java array
+//         jfloat* query = env->GetFloatArrayElements(queryVector, nullptr);
+//         if (query == nullptr) {
+//             throw std::runtime_error("Failed to get query vector");
+//         }
 
-        jint dimension = env->GetArrayLength(queryVector);
+//         jint dimension = env->GetArrayLength(queryVector);
 
-        // Convert Java Map to C++ unordered_map
-        std::unordered_map<std::string, jobject> parametersMap;
-        if (parameters != nullptr) {
-            parametersMap = jniUtil.ConvertJavaMapToCppMap(env, parameters);
-        }
+//         // Convert Java Map to C++ unordered_map
+//         std::unordered_map<std::string, jobject> parametersMap;
+//         if (parameters != nullptr) {
+//             parametersMap = jniUtil.ConvertJavaMapToCppMap(env, parameters);
+//         }
 
-        // Allocate arrays for results
-        auto distances = std::make_unique<jfloat[]>(k);
-        auto indices = std::make_unique<jlong[]>(k);
+//         // Allocate arrays for results
+//         auto distances = std::make_unique<jfloat[]>(k);
+//         auto indices = std::make_unique<jlong[]>(k);
 
-        // Query the index
-        int resultCount = knn_jni::puck_wrapper::knn_query_index(
-            indexPointer, query, dimension, k, parametersMap,
-            distances.get(), indices.get()
-        );
+//         // Query the index
+//         int resultCount = knn_jni::puck_wrapper::knn_query_index(
+//             indexPointer, query, dimension, k, parametersMap,
+//             distances.get(), indices.get()
+//         );
 
-        // Release query vector
-        env->ReleaseFloatArrayElements(queryVector, query, JNI_ABORT);
+//         // Release query vector
+//         env->ReleaseFloatArrayElements(queryVector, query, JNI_ABORT);
 
-        // Convert results to KNNQueryResult array
-        jclass knnQueryResultClass = env->FindClass("org/opensearch/knn/index/query/KNNQueryResult");
-        if (knnQueryResultClass == nullptr) {
-            throw std::runtime_error("Failed to find KNNQueryResult class");
-        }
+//         // Convert results to KNNQueryResult array
+//         jclass knnQueryResultClass = env->FindClass("org/opensearch/knn/index/query/KNNQueryResult");
+//         if (knnQueryResultClass == nullptr) {
+//             throw std::runtime_error("Failed to find KNNQueryResult class");
+//         }
 
-        jmethodID constructor = env->GetMethodID(knnQueryResultClass, "<init>", "(IF)V");
-        if (constructor == nullptr) {
-            throw std::runtime_error("Failed to find KNNQueryResult constructor");
-        }
+//         jmethodID constructor = env->GetMethodID(knnQueryResultClass, "<init>", "(IF)V");
+//         if (constructor == nullptr) {
+//             throw std::runtime_error("Failed to find KNNQueryResult constructor");
+//         }
 
-        jobjectArray results = env->NewObjectArray(resultCount, knnQueryResultClass, nullptr);
-        if (results == nullptr) {
-            throw std::runtime_error("Failed to create result array");
-        }
+//         jobjectArray results = env->NewObjectArray(resultCount, knnQueryResultClass, nullptr);
+//         if (results == nullptr) {
+//             throw std::runtime_error("Failed to create result array");
+//         }
 
-        for (int i = 0; i < resultCount; ++i) {
-            jobject result = env->NewObject(knnQueryResultClass, constructor, (jint)indices[i], (jfloat)distances[i]);
-            if (result != nullptr) {
-                env->SetObjectArrayElement(results, i, result);
-                env->DeleteLocalRef(result);
-            }
-        }
+//         for (int i = 0; i < resultCount; ++i) {
+//             jobject result = env->NewObject(knnQueryResultClass, constructor, (jint)indices[i], (jfloat)distances[i]);
+//             if (result != nullptr) {
+//                 env->SetObjectArrayElement(results, i, result);
+//                 env->DeleteLocalRef(result);
+//             }
+//         }
 
-        return results;
+//         return results;
 
-    } catch (...) {
-        jniUtil.CatchCppExceptionAndThrowJava(env);
-        return nullptr;
-    }
+//     } catch (...) {
+//         jniUtil.CatchCppExceptionAndThrowJava(env);
+//         return nullptr;
+//     }
+// }
+JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_PuckService_queryIndex(
+    JNIEnv* env, jclass cls, jlong indexPointerJ,
+    jfloatArray queryVectorJ, jint kJ, jobject methodParamsJ
+) {
+    knn_jni::JNIUtil jniUtil;
+    return knn_jni::puck_wrapper::QueryIndex(&jniUtil, env, indexPointerJ, queryVectorJ, kJ, methodParamsJ);
 }
 
 // Load index from stream
