@@ -273,3 +273,11 @@ GET /my-puck-index/_search
 4. Compare with FAISS IVF for your specific use case
 
 source /opt/intel/oneapi/setvars.sh && bash scripts/build.sh -v 2.19.3 -s false -o artifacts 
+
+## set env
+source /opt/intel/oneapi/mkl/2025.2/env/vars.sh
+export CPATH=/usr/include/mkl:$CPATH
+export C_INCLUDE_PATH=/usr/include/mkl:$C_INCLUDE_PATH
+export CPLUS_INCLUDE_PATH=/usr/include/mkl:$CPLUS_INCLUDE_PATH
+
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
