@@ -101,6 +101,11 @@ public:
         _conf = conf;
     }
 
+    void public_init_context_pool() {
+        // This calls the protected init_context_pool() from HierarchicalClusterIndex
+        init_context_pool();
+    }
+
     void directSetConf(const puck::IndexConf &conf, const std::string &tempDir) {
         _conf = conf;
         _conf.index_path = tempDir;
@@ -703,6 +708,7 @@ jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) 
         google::SetCommandLineOption("whether_pq", (conf.whether_pq ? "true" : "false"));
         google::SetCommandLineOption("nsq", std::to_string(conf.nsq).c_str());
         google::SetCommandLineOption("ks", std::to_string(conf.ks).c_str());
+        google::SetCommandLineOption("context_initial_pool_size", "16");
         // Also set file names flags if needed (optional, if consistent with build)
         // e.g. coarse_codebook_file_name, etc.
 
@@ -760,6 +766,10 @@ jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) 
             throw std::runtime_error("read_feature_index failed");
         }
 
+        // This creates a pool of SearchContext objects needed for concurrent searches
+
+        index->public_init_context_pool();
+
         // Wrap into metadata to return to Java
         IndexMetadata *meta = new IndexMetadata();
         meta->ids = std::move(ids);
@@ -786,94 +796,109 @@ jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) 
 }
 
 jobjectArray QueryIndex(
-    JNIUtilInterface* jniUtil,
+    knn_jni::JNIUtilInterface* jniUtil,
     JNIEnv* env,
     jlong indexPointerJ,
     jfloatArray queryVectorJ,
     jint kJ,
     jobject methodParamsJ,
-    jlongArray filterIdsJ,      // Can skip initially
-    jint filterIdsTypeJ     // ← Include but don't implement yet
-){
-    if (queryVectorJ == nullptr) {
-        throw std::runtime_error("Query Vector cannot be null");
-    }
-    
-    auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointerJ);
-    if (!metadata || !metadata->puckIndex) {
-        throw std::runtime_error("Invalid index pointer");
-    }
-    
-    // Extract query vector
-    float* rawQueryVector = jniUtil->GetFloatArrayElements(env, queryVectorJ, nullptr);
-    int dimension = jniUtil->GetJavaFloatArrayLength(env, queryVectorJ);
-    
-    // Prepare buffers
-    std::vector<float> distances(kJ);
-    std::vector<uint32_t> localIndices(kJ);
-    
-
-
-    
+    jintArray parentIdsJ
+) {
     try {
-        // Normalize query (CRITICAL!)
-        std::vector<float> normalizedQuery(dimension);
-        float norm = cblas_snrm2(dimension, rawQueryVector, 1);
+        LOG(INFO) << "[Puck-JNI] QueryIndex START, k=" << kJ;
         
-        if (norm > 1e-6) {
-            float invNorm = 1.0f / norm;
-            for (int i = 0; i < dimension; i++) {
-                normalizedQuery[i] = rawQueryVector[i] * invNorm;
-            }
-        } else {
-            std::copy(rawQueryVector, rawQueryVector + dimension, normalizedQuery.begin());
+        // 1. Get metadata (NOT PuckIndex directly!)
+        auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointerJ);
+        if (!metadata || !metadata->puckIndex) {
+            throw std::runtime_error("Invalid metadata pointer");
         }
         
-        // Prepare request
+        LOG(INFO) << "[Puck-JNI] Index has " << metadata->ids.size() << " documents";
+        
+        // 2. Extract and normalize query vector
+        float* queryArray = jniUtil->GetFloatArrayElements(env, queryVectorJ, nullptr);
+        jsize dimension = jniUtil->GetJavaFloatArrayLength(env, queryVectorJ);
+        
+        std::vector<float> normalizedQuery(dimension);
+        float norm = 0.0f;
+        for (int i = 0; i < dimension; i++) {
+            norm += queryArray[i] * queryArray[i];
+        }
+        norm = std::sqrt(norm);
+        
+        if (norm > 1e-6) {
+            for (int i = 0; i < dimension; i++) {
+                normalizedQuery[i] = queryArray[i] / norm;
+            }
+            LOG(INFO) << "[Puck-JNI] Query normalized, norm=" << norm;
+        } else {
+            std::copy(queryArray, queryArray + dimension, normalizedQuery.begin());
+        }
+        
+        jniUtil->ReleaseFloatArrayElements(env, queryVectorJ, queryArray, JNI_ABORT);
+        
+        // 3. Prepare PUCK request/response
         puck::Request request;
+        request.topk = static_cast<uint32_t>(kJ);
         request.feature = normalizedQuery.data();
-        request.topk = kJ;
+        
+        std::vector<float> distances(kJ);
+        std::vector<uint32_t> localIndices(kJ);
         
         puck::Response response;
         response.distance = distances.data();
         response.local_idx = localIndices.data();
         response.result_num = 0;
         
-        // Use search() not public_search()
-        int result = metadata->puckIndex->search(&request, &response);
+        // 4. Execute search - Puck manages SearchContext internally via _context_pool
+        LOG(INFO) << "[Puck-JNI] Calling PuckIndex::search()";
+        int ret = metadata->puckIndex->public_search(&request, &response);
         
-        if (result != 0) {
-            throw std::runtime_error("Search failed: " + std::to_string(result));
+        if (ret != 0) {
+            throw std::runtime_error("PuckIndex::search failed: " + std::to_string(ret));
         }
         
+        LOG(INFO) << "[Puck-JNI] Search found " << response.result_num << " results";
+        
+        // 5. Create KNNQueryResult array (FAISS pattern)
         int resultSize = std::min(kJ, static_cast<int>(response.result_num));
         
-        // Create Java result array (FAISS style)
         jclass resultClass = jniUtil->FindClass(env, "org/opensearch/knn/index/query/KNNQueryResult");
         jmethodID constructor = jniUtil->FindMethod(env, "org/opensearch/knn/index/query/KNNQueryResult", "<init>");
+        
         jobjectArray results = jniUtil->NewObjectArray(env, resultSize, resultClass, nullptr);
         
+        // 6. Fill results with document ID mapping
         for (int i = 0; i < resultSize; i++) {
             uint32_t localIdx = response.local_idx[i];
+            
+            // Validate index
             if (localIdx >= metadata->ids.size()) {
-                throw std::runtime_error("Invalid local index");
+                throw std::runtime_error("Invalid local index: " + std::to_string(localIdx));
             }
             
+            // Map to actual document ID
             jlong docId = static_cast<jlong>(metadata->ids[localIdx]);
-            jfloat dist = distances[i];
+            jfloat distance = response.distance[i];
             
-            jobject resultObj = jniUtil->NewObject(env, resultClass, constructor, docId, dist);
-            jniUtil->SetObjectArrayElement(env, results, i, resultObj);
+            LOG(INFO) << "[Puck-JNI] Result[" << i << "]: localIdx=" << localIdx 
+                      << ", docId=" << docId << ", dist=" << distance;
+            
+            jobject result = jniUtil->NewObject(env, resultClass, constructor, docId, distance);
+            jniUtil->SetObjectArrayElement(env, results, i, result);
         }
         
-        jniUtil->ReleaseFloatArrayElements(env, queryVectorJ, rawQueryVector, JNI_ABORT);
+        LOG(INFO) << "[Puck-JNI] QueryIndex SUCCESS, returned " << resultSize << " results";
         return results;
         
-    } catch (...) {
-        jniUtil->ReleaseFloatArrayElements(env, queryVectorJ, rawQueryVector, JNI_ABORT);
-        throw;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "[Puck-JNI] QueryIndex ERROR: " << e.what();
+        jniUtil->ThrowJavaException(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
     }
 }
+
+
 
 
 // Query
