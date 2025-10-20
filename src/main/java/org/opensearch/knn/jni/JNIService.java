@@ -322,7 +322,7 @@ public class JNIService {
         }
 
         if (KNNEngine.PUCK == knnEngine) {
-            return PuckService.queryIndex(indexPointer, queryVector, k, methodParameters);
+            return PuckService.queryIndex(indexPointer, queryVector, k, methodParameters, parentIds);
         }
 
         throw new IllegalArgumentException(
@@ -396,8 +396,26 @@ public class JNIService {
             return;
         }
 
+        if (KNNEngine.PUCK == knnEngine) {
+            PuckService.freeIndex(indexPointer);
+            return;
+        }
+
         throw new IllegalArgumentException(String.format(Locale.ROOT, "Free not supported for provided engine : %s", knnEngine.getName()));
     }
+    // public static void free(final long indexPointer, final KNNEngine knnEngine, final boolean isBinaryIndex) {
+    // if (KNNEngine.NMSLIB == knnEngine) {
+    // NmslibService.free(indexPointer);
+    // return;
+    // }
+
+    // if (KNNEngine.FAISS == knnEngine) {
+    // FaissService.free(indexPointer, isBinaryIndex);
+    // return;
+    // }
+
+    // throw new IllegalArgumentException(String.format(Locale.ROOT, "Free not supported for provided engine : %s", knnEngine.getName()));
+    // }
 
     /**
      * Deallocate memory of the shared index state
