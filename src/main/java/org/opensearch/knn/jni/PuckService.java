@@ -81,10 +81,17 @@ public class PuckService {
      * @param indexPointer pointer to index in memory
      * @param queryVector  query vector
      * @param k           number of nearest neighbors to return
-     * @param parameters  query parameters
+     * @param methodParameters method parameter
+     * @param parentIds list of parent doc ids when the knn field is a nested field
      * @return KNNQueryResult array
      */
-    public static native KNNQueryResult[] queryIndex(long indexPointer, float[] queryVector, int k, Map<String, ?> parameters);
+    public static native KNNQueryResult[] queryIndex(
+        long indexPointer,
+        float[] queryVector,
+        int k,
+        Map<String, ?> methodParameters,
+        int[] parentIds
+    );
 
     /**
      * Load an index into memory via a wrapping having Lucene's IndexInput.
