@@ -49,7 +49,7 @@ JNIEXPORT jbyteArray JNICALL Java_org_opensearch_knn_jni_PuckService_trainIndex
  * Signature: (J[FILjava/util/Map;)[Lorg/opensearch/knn/index/query/KNNQueryResult;
  */
 JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_PuckService_queryIndex
-  (JNIEnv *, jclass, jlong, jfloatArray, jint, jobject);
+  (JNIEnv *, jclass, jlong, jfloatArray, jint, jobject, jintArray);
 
 /*
  * Class:     org_opensearch_knn_jni_PuckService
