@@ -142,11 +142,24 @@ JNIEXPORT jbyteArray JNICALL Java_org_opensearch_knn_jni_PuckService_trainIndex(
 //     }
 // }
 JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_PuckService_queryIndex(
-    JNIEnv* env, jclass cls, jlong indexPointerJ,
-    jfloatArray queryVectorJ, jint kJ, jobject methodParamsJ
-) {
-    knn_jni::JNIUtil jniUtil;
-    return knn_jni::puck_wrapper::QueryIndex(&jniUtil, env, indexPointerJ, queryVectorJ, kJ, methodParamsJ);
+    JNIEnv * env, jclass cls, jlong indexPointerJ,
+    jfloatArray queryVectorJ, jint kJ, jobject methodParamsJ, jintArray parentIdsJ) {
+    try {
+        return knn_jni::puck_wrapper::QueryIndex(&jniUtil, env, indexPointerJ, queryVectorJ, kJ, methodParamsJ, parentIdsJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+    return nullptr;
+}
+
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_PuckService_loadIndex(JNIEnv * env, jclass cls, jstring indexPathJ)
+{
+  try {
+      return knn_jni::puck_wrapper::LoadIndex(&jniUtil, env, indexPathJ);
+  } catch (...) {
+      jniUtil.CatchCppExceptionAndThrowJava(env);
+  }
+  return NULL;
 }
 
 // Load index from stream
