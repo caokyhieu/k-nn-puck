@@ -18,6 +18,8 @@ static knn_jni::JNIUtil jniUtil;
 JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_PuckService_initLibrary(JNIEnv * env, jclass cls)
 {
     jniUtil.Initialize(env);
+    // ⭐ Initialize glog for Puck
+
 }
 
 // Create index
@@ -159,51 +161,31 @@ JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_PuckService_loadIndex(JNIEnv
   } catch (...) {
       jniUtil.CatchCppExceptionAndThrowJava(env);
   }
-  return NULL;
+  return 0;
 }
 
 // Load index from stream
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_PuckService_loadIndexWithStream(
     JNIEnv *env, jclass cls, jobject input) {
-    try {
-        return knn_jni::puck_wrapper::LoadIndex(&jniUtil, env, input);
-    } catch (...) {
-        jniUtil.CatchCppExceptionAndThrowJava(env);
-        return 0;
-    }
+        return knn_jni::puck_wrapper::LoadIndexWithStream(&jniUtil, env, input);
+    
 }
 
 // Load binary index from file path (Puck doesn't distinguish binary, but keeping for API compatibility)
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_PuckService_loadBinaryIndex(
     JNIEnv *env, jclass cls, jstring indexPath) {
-    try {
-        const char* path = env->GetStringUTFChars(indexPath, nullptr);
-        if (path == nullptr) {
-            throw std::runtime_error("Failed to get index path");
-        }
+    
+        return Java_org_opensearch_knn_jni_PuckService_loadIndex(env, cls, indexPath);
 
-        // Puck uses file-based loading - this would need proper implementation
-        // For now, throw an exception as we primarily use stream-based loading
-        env->ReleaseStringUTFChars(indexPath, path);
-        throw std::runtime_error("File-based loading not yet implemented for Puck. Use stream-based loading.");
-
-    } catch (...) {
-        jniUtil.CatchCppExceptionAndThrowJava(env);
-        return 0;
-    }
 }
+
 
 // Load binary index from stream (Puck doesn't distinguish binary, delegates to loadIndexWithStream)
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_PuckService_loadBinaryIndexWithStream(
-    JNIEnv *env, jclass cls, jobject input) {
-    return Java_org_opensearch_knn_jni_PuckService_loadIndexWithStream(env, cls, input);
+    JNIEnv *env, jclass cls, jobject readStream) {
+    return Java_org_opensearch_knn_jni_PuckService_loadIndexWithStream(env, cls, readStream);
 }
 
-// Load index from file path
-JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_PuckService_loadIndex(
-    JNIEnv *env, jclass cls, jstring indexPath) {
-    return Java_org_opensearch_knn_jni_PuckService_loadBinaryIndex(env, cls, indexPath);
-}
 
 // Free index from memory
 JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_PuckService_freeIndex(JNIEnv *env, jclass cls, jlong indexPointer) {
