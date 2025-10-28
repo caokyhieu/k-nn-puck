@@ -23,11 +23,21 @@
 #include "puck/gflags/puck_gflags.h"
 #include "puck/search_context.h"
 #include <glog/logging.h>
+#include <filesystem>
 
 jint JNI_OnLoad(JavaVM* vm, void*) {
     google::InitGoogleLogging("opensearchknn_puck");
+    // Configure glog to output to stderr (so it appears in OpenSearch logs)
+    FLAGS_logtostderr = true;           // Send logs to stderr
+    FLAGS_stderrthreshold = google::INFO; // Log INFO and above to stderr
+    FLAGS_minloglevel = google::INFO;   // Minimum log level
+    FLAGS_colorlogtostderr = false;     // No color codes
+    FLAGS_logbufsecs = 0;               // Flush immediately
+    
+    std::cerr << "[Puck-JNI] Library loaded, glog configured to stderr" << std::endl;
     return JNI_VERSION_1_8;
 }
+
 
 namespace {
     std::string createUniqueTempDir(const std::string& prefix) {
@@ -87,88 +97,28 @@ namespace {
     }
 }
 
-class PuckIndexWrapper : public puck::PuckIndex {
-public:
-    int public_init_single_build() {
-        return init_single_build();
-    }
-    
-    int public_single_build(puck::PuckBuildInfo* build_info) {
-        return single_build(build_info);
-    }
-    
-    void public_set_conf(const puck::IndexConf& conf) {
-        _conf = conf;
-    }
-
-    void public_init_context_pool() {
-        // This calls the protected init_context_pool() from HierarchicalClusterIndex
-        init_context_pool();
-    }
-
-    void directSetConf(const puck::IndexConf &conf, const std::string &tempDir) {
-        _conf = conf;
-        _conf.index_path = tempDir;
-        _conf.coarse_codebook_file_name = tempDir + "/coarse_codebook.dat";
-        _conf.fine_codebook_file_name   = tempDir + "/fine_codebook.dat";
-        _conf.filter_codebook_file_name = tempDir + "/filter_codebook.dat";
-        _conf.filter_data_file_name     = tempDir + "/filter_data.dat";
-        _conf.pq_codebook_file_name     = tempDir + "/pq_codebook.dat";
-        _conf.pq_data_file_name         = tempDir + "/pq_data.dat";
-        _conf.cell_assign_file_name     = tempDir + "/cell_assign.dat";
-        _conf.index_file_name           = tempDir + "/index.dat";
-    }
-
-    
-    int public_init_model_memory() {
-        return init_model_memory();
-    }
-    
-    int public_read_coodbooks() {
-        return read_coodbooks();
-    }
-
-
-    
-    int public_convert_local_to_memory_idx(uint32_t* cell_start_memory_idx, 
-                                           uint32_t* local_to_memory_idx) {
-        return convert_local_to_memory_idx(cell_start_memory_idx, local_to_memory_idx);
-    }
-    
-    int public_read_feature_index(uint32_t* local_to_memory_idx) {
-        return read_feature_index(local_to_memory_idx);
-    }
-    
-    int public_search(puck::Request* request, puck::Response* response) {
-        return search(request, response);
-    }
-    
-    puck::IndexConf& get_index_conf() {
-        return _conf;
-    }
-};
 
 namespace knn_jni {
 namespace puck_wrapper {
 
 #define PUCK_LOG(msg) std::cout << "[PUCK JNI] " << msg << std::endl;
 
+
+
 struct IndexMetadata {
     std::vector<int> ids;
     std::vector<float> vectors;
     std::vector<uint32_t> cellAssignments;
-    uint32_t dimension;
-    uint32_t numVectors;
-    std::unique_ptr<PuckIndexWrapper> puckIndex;
+    std::unique_ptr<puck::PuckIndex> puckIndex;  // Can point to any index type
     puck::IndexConf indexConf;
     std::string tempDir;  // Temp dir to clean up
+    uint32_t dimension;
+    uint32_t numVectors;
 
-    ~IndexMetadata() {
-        if (!tempDir.empty()) {
-            ::system(("rm -rf " + tempDir).c_str());
-        }
-    }
+   
 };
+
+
 
 
 
@@ -202,8 +152,10 @@ jbyteArray TrainIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject p
 
         std::string tempDir = createUniqueTempDir("puck_train");
 
+
+        // write feature file to index later , need to clean that up after indexing
         try {
-            std::string vectorsFile = tempDir + "/train_vectors.fvecs";
+            std::string vectorsFile = tempDir + "/" + "all_data.feat.bin"; // hard code file name
             std::ofstream out(vectorsFile, std::ios::binary);
             if (!out.is_open()) {
                 throw std::runtime_error("Failed to create training file");
@@ -217,6 +169,8 @@ jbyteArray TrainIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject p
             }
             out.close();
 
+            
+            
             google::SetCommandLineOption("index_path", tempDir.c_str());
             google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
             google::SetCommandLineOption("coarse_cluster_count", std::to_string(coarseClusters).c_str());
@@ -226,36 +180,31 @@ jbyteArray TrainIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject p
             google::SetCommandLineOption("whether_pq", "true");
             google::SetCommandLineOption("whether_filter", "true");
             google::SetCommandLineOption("whether_norm", "false");
-            google::SetCommandLineOption("threads_count", "8");
-            google::SetCommandLineOption("feature_file_name", "train_vectors.fvecs");
-            google::SetCommandLineOption("coarse_codebook_file_name", "coarse_codebook.dat");
-            google::SetCommandLineOption("fine_codebook_file_name", "fine_codebook.dat");
-            google::SetCommandLineOption("filter_codebook_file_name", "filter_codebook.dat");
-            google::SetCommandLineOption("pq_codebook_file_name", "pq_codebook.dat");
-            google::SetCommandLineOption("filter_data_file_name", "filter_data.dat");
-            google::SetCommandLineOption("pq_data_file_name", "pq_data.dat");
-            google::SetCommandLineOption("index_file_name", "index.dat");
 
-            auto puckIndex = std::make_unique<PuckIndexWrapper>();
-            if (!puckIndex) {
+            // init PuckIndex
+            puck::PuckIndex* puckIdx = new puck::PuckIndex();
+            
+            if (!puckIdx) {
                 throw std::runtime_error("Failed to create PuckIndex");
             }
 
             std::cerr << "[Puck] Starting training..." << std::endl;
-            int trainResult = puckIndex->train();
+            int trainResult = puckIdx->train();
             if (trainResult != 0) {
                 throw std::runtime_error("Training failed: " + std::to_string(trainResult));
             }
             std::cerr << "[Puck] Training completed" << std::endl;
 
-            // Serialize model files
-            std::vector<std::string> modelFiles = {
-                "coarse_codebook.dat",
-                "fine_codebook.dat",
-                "filter_codebook.dat",
-                "pq_codebook.dat",
+
+            // Serialize model files, take from puckIdx->_conf, these are 5 important fields decide to the index result
+           std::vector<std::string> modelFiles = {
+                "coarse.dat",
+                "fine.dat",
+                "filter_codebook.dat", 
+                "learn_codebooks.dat",
                 "index.dat"
             };
+            
 
             size_t totalSize = sizeof(int32_t);
             for (const auto& filename : modelFiles) {
@@ -307,14 +256,16 @@ jbyteArray TrainIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject p
             jniUtil->SetByteArrayRegion(env, result, 0, serialized.size(),
                                        reinterpret_cast<const jbyte*>(serialized.data()));
 
-            ::system(("rm -rf " + tempDir).c_str());
             jniUtil->DeleteLocalRef(env, parametersJ);
 
             std::cerr << "[Puck] Training complete, model size=" << serialized.size() << " bytes" << std::endl;
+
+            // delete temp dir
+            std::filesystem::remove_all(tempDir);
+            std::cerr << "[Puck] Deleted temporary directory: " << tempDir << std::endl;
             return result;
 
         } catch (...) {
-            ::system(("rm -rf " + tempDir).c_str());
             throw;
         }
 
@@ -324,7 +275,51 @@ jbyteArray TrainIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject p
     }
 }
 
-// CreateIndexFromTemplate
+
+jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jstring indexPathJ) {
+    if (indexPathJ == nullptr) {
+        jniUtil->ThrowJavaException(env, "java/lang/NullPointerException", "Index path is null");
+        return 0;
+    }
+
+    try {
+        
+        std::string indexPath(jniUtil->ConvertJavaStringToCppString(env, indexPathJ));
+        
+        //set index type and path
+        google::SetCommandLineOption("index_path", indexPath.c_str());
+
+        puck::PuckIndex* index = new puck::PuckIndex();
+        index->init();
+
+        if (!index) {
+            throw std::runtime_error("Failed to create PuckIndex");
+        }
+        std::cerr << "[Puck] Loading index from: " << indexPath << std::endl;
+        //set the path
+       
+        // read dimension and num vectors 
+        // Create metadata
+        IndexMetadata* meta = new IndexMetadata();
+        meta->puckIndex.reset(index);  // Transfer ownership to unique_ptr
+        meta->indexConf = readIndexConf(indexPath + '/' + "index.dat");
+        meta->dimension = meta->indexConf.feature_dim;
+        meta->numVectors = meta->indexConf.total_point_count;
+        meta->tempDir = indexPath;
+        // need more
+        
+        // Note: You need to decide how to store/retrieve IDs and raw vectors for file-based loading
+
+        return reinterpret_cast<jlong>(meta);
+
+    } catch (const std::exception& e) {
+        jniUtil->ThrowJavaException(env, "java/lang/Exception", e.what());
+        return 0;
+    }
+}
+
+
+
 void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jintArray idsJ,
                              jlong vectorsAddressJ, jint dimJ, jobject output,
                              jbyteArray templateIndexJ, jobject parametersJ) {
@@ -333,6 +328,8 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
         throw std::runtime_error("Invalid parameters");
     }
 
+   
+    // read vectors to build index 
     try {
         auto* inputVectors = reinterpret_cast<std::vector<float>*>(vectorsAddressJ);
         int dim = static_cast<int>(dimJ);
@@ -345,9 +342,11 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
 
         std::cerr << "[Puck] Creating index: " << numVectors << " vectors, dim=" << dim << std::endl;
 
+        // parse the important files for PuckIndex creation from serialized templateIndexJ (5 files when we trained index)
         int templateSize = jniUtil->GetJavaBytesArrayLength(env, templateIndexJ);
         jbyte* templateBytes = jniUtil->GetByteArrayElements(env, templateIndexJ, nullptr);
 
+        // create temp dir to save index files for building
         std::string tempDir = createUniqueTempDir("puck_build");
 
         try {
@@ -390,8 +389,14 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
 
             jniUtil->ReleaseByteArrayElements(env, templateIndexJ, templateBytes, JNI_ABORT);
 
+                  // ✅ Set gflags BEFORE init_single_build
+            google::SetCommandLineOption("index_path", tempDir.c_str()); // just need to set the index folder(temp dir) we created, puck will build from index files
+
+            //  create index
+            puck::Index* index = new puck::PuckIndex();
+
             // ✅ Read config FIRST
-            std::string indexDatPath = tempDir + "/index.dat";
+            std::string indexDatPath = tempDir + '/' + "index.dat"; // this file just saved from previous step
             puck::IndexConf conf = readIndexConf(indexDatPath);
 
             std::cerr << "[Puck] Config: filter_nsq=" << conf.filter_nsq 
@@ -404,118 +409,50 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
             std::cerr << "[Puck] Quantization format: filter=" << filterBytesPerVector 
                      << " bytes/vec, pq=" << pqBytesPerVector << " bytes/vec" << std::endl;
 
-            // ✅ Set gflags BEFORE init_single_build
-            google::SetCommandLineOption("index_path", tempDir.c_str());
-            google::SetCommandLineOption("feature_dim", std::to_string(dim).c_str());
-            google::SetCommandLineOption("total_point_count", std::to_string(numVectors).c_str());
-            google::SetCommandLineOption("filter_data_file_name", "filter_data.dat");
-            google::SetCommandLineOption("pq_data_file_name", "pq_data.dat");
-            google::SetCommandLineOption("coarse_codebook_file_name", "coarse_codebook.dat");
-            google::SetCommandLineOption("fine_codebook_file_name", "fine_codebook.dat");
-            google::SetCommandLineOption("filter_codebook_file_name", "filter_codebook.dat");
-            google::SetCommandLineOption("pq_codebook_file_name", "pq_codebook.dat");
-            google::SetCommandLineOption("index_file_name", "index.dat");
-            google::SetCommandLineOption("cell_assign_file_name", "cell_assign.dat");
-
-            auto index = std::make_unique<PuckIndexWrapper>();
+      
             
             std::cerr << "[Puck] Initializing PuckIndex for building..." << std::endl;
-            int initResult = index->public_init_single_build();
-            if (initResult != 0) {
-                throw std::runtime_error("init_single_build failed: " + std::to_string(initResult));
-            }
+            
 
             jint* ids = jniUtil->GetIntArrayElements(env, idsJ, nullptr);
-
-            // Use byte buffers sized from config
-            std::vector<uint8_t> filterData(numVectors * filterBytesPerVector);
-            std::vector<uint8_t> pqData(numVectors * pqBytesPerVector);
-            std::vector<uint32_t> cellAssignments(numVectors);
-
             std::cerr << "[Puck] Building index with " << numVectors << " vectors..." << std::endl;
+
             
-            for (int i = 0; i < numVectors; i++) {
-                puck::PuckBuildInfo buildInfo;
-                buildInfo.feature.assign(
-                    inputVectors->data() + i * dim,
-                    inputVectors->data() + (i + 1) * dim
-                );
-
-                int buildResult = index->public_single_build(&buildInfo);
-                if (buildResult != 0) {
-                    throw std::runtime_error("Build failed for vector " + std::to_string(i));
-                }
-
-                cellAssignments[i] = buildInfo.nearest_cell.cell_id;
-
-                // Extract quantization: [offset:4][codes:nsq]
-                if (buildInfo.quantizated_feature.size() >= 2) {
-                    // Filter quantization
-                    auto& filterQuant = buildInfo.quantizated_feature[0];
-                    float filterOffset = filterQuant.first;
-                    const auto& filterCodes = filterQuant.second;
-                    
-                    size_t filterPos = i * filterBytesPerVector;
-                    std::memcpy(&filterData[filterPos], &filterOffset, sizeof(float));
-                    std::memcpy(&filterData[filterPos + sizeof(float)], 
-                               filterCodes.data(), 
-                               std::min(filterCodes.size(), (size_t)conf.filter_nsq));
-                    
-                    // PQ quantization
-                    auto& pqQuant = buildInfo.quantizated_feature[1];
-                    float pqOffset = pqQuant.first;
-                    const auto& pqCodes = pqQuant.second;
-                    
-                    size_t pqPos = i * pqBytesPerVector;
-                    std::memcpy(&pqData[pqPos], &pqOffset, sizeof(float));
-                    std::memcpy(&pqData[pqPos + sizeof(float)], 
-                               pqCodes.data(), 
-                               std::min(pqCodes.size(), (size_t)conf.nsq));
-                    
-                    if (i == 0) {
-                        std::cerr << "[Puck] Vector 0 quantization:" << std::endl;
-                        std::cerr << "  Filter: offset=" << filterOffset 
-                                 << ", codes=" << filterCodes.size() << " bytes" << std::endl;
-                        std::cerr << "  PQ: offset=" << pqOffset 
-                                 << ", codes=" << pqCodes.size() << " bytes" << std::endl;
-                    }
-                } else {
-                    throw std::runtime_error("Quantization data not generated for vector " + std::to_string(i));
-                }
-
-                if ((i + 1) % 1000 == 0) {
-                    std::cerr << "[Puck] Built " << (i + 1) << "/" << numVectors << std::endl;
-                }
+            // we write the vectors in fvecs format into folder tempDir
+            // using function like in TrainIndex
+            try {
+            std::string vectorsFile = tempDir + '/' + "all_data.feat.bin";
+            std::ofstream out(vectorsFile, std::ios::binary);
+            if (!out.is_open()) {
+                throw std::runtime_error("Failed to create training file");
             }
 
-            std::cerr << "[Puck] All vectors processed with single_build" << std::endl;
+            for (int i = 0; i < numVectors; i++) {
+                out.write(reinterpret_cast<const char*>(&dim), sizeof(int32_t));
+                const float* vec = inputVectors->data() + (i * dim);
+                out.write(reinterpret_cast<const char*>(vec), dim * sizeof(float));
+            }
+            out.close();
+            } catch (const std::exception& e) {
+                throw std::runtime_error("Failed to write vectors for building: " + std::string(e.what()));
+            }
 
-            // Write quantization data
-            std::string filterDataPath = tempDir + "/filter_data.dat";
-            std::string pqDataPath = tempDir + "/pq_data.dat";
-            std::string cellAssignPath = tempDir + "/cell_assign.dat";
+            // init for build, just after writing vectors features
+            index->init(); // remember to init after settting the directory
 
-            std::ofstream filterFile(filterDataPath, std::ios::binary);
-            filterFile.write(reinterpret_cast<const char*>(filterData.data()), filterData.size());
-            filterFile.close();
-
-            std::ofstream pqFile(pqDataPath, std::ios::binary);
-            pqFile.write(reinterpret_cast<const char*>(pqData.data()), pqData.size());
-            pqFile.close();
-
-            std::ofstream cellFile(cellAssignPath, std::ios::binary);
-            cellFile.write(reinterpret_cast<const char*>(cellAssignments.data()), 
-                          numVectors * sizeof(uint32_t));
+            // after writing vectors, we can build the index
+            if (index->build() != 0) {
+                throw std::runtime_error("Build failed");
+            }
+            std::cerr << "[Puck] Index build completed" << std::endl;
+            // after building, puck will generate cell_assign.dat file
+            // Read cell assignments
+            std::string cellAssignPath = tempDir + '/' + "cell_assign.dat";
+            std::ifstream cellFile(cellAssignPath, std::ios::binary);
+            std::vector<uint32_t> cellAssignments(numVectors);
+            cellFile.read(reinterpret_cast<char*>(cellAssignments.data()),
+                        numVectors * sizeof(uint32_t));
             cellFile.close();
-
-            std::cerr << "[Puck] Quantization data written:" << std::endl;
-            std::cerr << "  - filter_data.dat: " << filterData.size() 
-                     << " bytes (" << filterBytesPerVector << " bytes/vector)" << std::endl;
-            std::cerr << "  - pq_data.dat: " << pqData.size() 
-                     << " bytes (" << pqBytesPerVector << " bytes/vector)" << std::endl;
-            std::cerr << "  - cell_assign.dat: " << (numVectors * sizeof(uint32_t)) << " bytes" << std::endl;
-
-            std::cerr << "[Puck] Index built successfully" << std::endl;
 
             // Write to OpenSearch stream
             std::cerr << "[Puck] Serializing index to OpenSearch..." << std::endl;
@@ -538,15 +475,17 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
                               numVectors * sizeof(uint32_t));
 
             std::vector<std::string> allFiles = fileNames;
+            // after building, we have extra 3 files to add: filter_data.dat, pq_data.dat, cell_assign.dat
             allFiles.push_back("filter_data.dat");
             allFiles.push_back("pq_data.dat");
             allFiles.push_back("cell_assign.dat");
+
 
             int32_t numAllFiles = allFiles.size();
             mediator.writeBytes(reinterpret_cast<const uint8_t*>(&numAllFiles), sizeof(numAllFiles));
 
             std::cerr << "[Puck] Writing " << numAllFiles << " files to index..." << std::endl;
-
+            // serialize each file
             for (const auto& filename : allFiles) {
                 std::string filepath = tempDir + "/" + filename;
                 std::ifstream file(filepath, std::ios::binary | std::ios::ate);
@@ -575,14 +514,15 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
             mediator.flush();
 
             jniUtil->ReleaseIntArrayElements(env, idsJ, ids, JNI_ABORT);
-            ::system(("rm -rf " + tempDir).c_str());
             delete inputVectors;
             jniUtil->DeleteLocalRef(env, parametersJ);
 
             std::cerr << "[Puck] Index creation complete!" << std::endl;
+            // delete temp dir
+            std::filesystem::remove_all(tempDir);
+            std::cerr << "[Puck] Deleted temporary directory: " << tempDir << std::endl;
 
         } catch (...) {
-            ::system(("rm -rf " + tempDir).c_str());
             throw;
         }
 
@@ -593,69 +533,79 @@ void CreateIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, ji
 }
 
 
+
 // Full corrected LoadIndex
-jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) {
+jlong LoadIndexWithStream(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) {
+    std::cerr << "[Puck] LoadIndexWithStream called" << std::endl;  // ← Use cerr
+    
     if (input == nullptr) {
+        std::cerr << "[Puck] ERROR: IndexInput is null" << std::endl;
         jniUtil->ThrowJavaException(env, "java/lang/NullPointerException", "IndexInput is null");
         return 0;
     }
 
     std::string tempDir;
     try {
+        // read from input stream serialized index
         stream::NativeEngineIndexInputMediator mediator(jniUtil, env, input);
+        std::cerr << "[Puck] Created mediator" << std::endl;
 
         // Read header
         uint32_t magic = 0;
         mediator.copyBytes(sizeof(magic), reinterpret_cast<uint8_t*>(&magic));
+        std::cerr << "[Puck] Read magic: 0x" << std::hex << magic << std::dec << std::endl;
+        
         const uint32_t EXPECTED_MAGIC = 0x5055434B;
         if (magic != EXPECTED_MAGIC) {
+            std::cerr << "[Puck] ERROR: Invalid magic" << std::endl;
             throw std::runtime_error("Invalid Puck index format (bad magic)");
         }
 
         uint32_t version;
         mediator.copyBytes(sizeof(version), reinterpret_cast<uint8_t*>(&version));
-        // Optionally validate version
-
+        
         uint32_t dimension, numVectors;
         mediator.copyBytes(sizeof(dimension), reinterpret_cast<uint8_t*>(&dimension));
         mediator.copyBytes(sizeof(numVectors), reinterpret_cast<uint8_t*>(&numVectors));
 
-        LOG(INFO) << "[Puck] Loading index: " << numVectors << " vectors, dim=" << dimension;
+        std::cerr << "[Puck] Loading index: " << numVectors << " vectors, dim=" << dimension << std::endl;
 
         // Read IDs, raw vectors, cell assignments
         std::vector<int> ids(numVectors);
         mediator.copyBytes(numVectors * sizeof(int),
                            reinterpret_cast<uint8_t*>(ids.data()));
+        std::cerr << "[Puck] Read " << numVectors << " IDs" << std::endl;
 
         std::vector<float> vectors(numVectors * dimension);
         mediator.copyBytes(numVectors * dimension * sizeof(float),
                            reinterpret_cast<uint8_t*>(vectors.data()));
+        std::cerr << "[Puck] Read " << numVectors << " vectors" << std::endl;
 
         std::vector<uint32_t> cellAssignments(numVectors);
         mediator.copyBytes(numVectors * sizeof(uint32_t),
                            reinterpret_cast<uint8_t*>(cellAssignments.data()));
+        std::cerr << "[Puck] Read cell assignments" << std::endl;
 
         // Read number of files
         int32_t numAllFiles = 0;
         mediator.copyBytes(sizeof(int32_t),
                            reinterpret_cast<uint8_t*>(&numAllFiles));
+        std::cerr << "[Puck] Number of files to extract: " << numAllFiles << std::endl;
+        
         if (numAllFiles <= 0) {
             throw std::runtime_error("Invalid file count in serialized index");
         }
 
-        // Create a temp directory for extraction
+        // Create temp directory
         tempDir = createUniqueTempDir("puck_load");
+        std::cerr << "[Puck] Created temp dir: " << tempDir << std::endl;
 
-        // Extract model files
-        std::vector<std::string> filenames;
-        filenames.reserve(numAllFiles);
+        // Extract model files and write to temp dir
         for (int i = 0; i < numAllFiles; i++) {
             int32_t nameLen = 0;
             mediator.copyBytes(sizeof(nameLen),
                                reinterpret_cast<uint8_t*>(&nameLen));
-            if (nameLen <= 0 || nameLen > 1024) {
-                throw std::runtime_error("Invalid filename length " + std::to_string(nameLen));
-            }
+            
             std::vector<char> nameBuf(nameLen);
             mediator.copyBytes(nameLen,
                                reinterpret_cast<uint8_t*>(nameBuf.data()));
@@ -664,9 +614,6 @@ jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) 
             int64_t fileSize = 0;
             mediator.copyBytes(sizeof(fileSize),
                                reinterpret_cast<uint8_t*>(&fileSize));
-            if (fileSize < 0) {
-                throw std::runtime_error("Invalid file size for " + fname);
-            }
 
             std::vector<char> fileBuf(fileSize);
             if (fileSize > 0) {
@@ -679,122 +626,171 @@ jlong LoadIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jobject input) 
             of.write(fileBuf.data(), fileBuf.size());
             of.close();
 
-            filenames.push_back(fname);
-            LOG(INFO) << "[Puck]   - Extracted " << fname << " (" << fileSize << " bytes)";
+            std::cerr << "[Puck]   Extracted " << fname << " (" << fileSize << " bytes)" << std::endl;
         }
 
-        // Now we must read config (index.dat) so we know filter_nsq, nsq, cluster counts, etc.
-        std::string indexDatPath = tempDir + "/index.dat";
+        std::cerr << "[Puck] All files extracted" << std::endl;
+        // Set temp dir to gflags for puck to load files
+        google::SetCommandLineOption("index_path", tempDir.c_str());
+
+        // Create and initialize index
+        puck::PuckIndex* index = new puck::PuckIndex();
+        
+        // Read config
+        std::string indexDatPath = tempDir + "/" + "index.dat";
         puck::IndexConf conf = readIndexConf(indexDatPath);
-        // Override conf.number_of_vectors from serialized data
         conf.feature_dim = dimension;
         conf.total_point_count = numVectors;
 
-        LOG(INFO) << "[Puck] Config loaded: coarse=" << conf.coarse_cluster_count
+        std::cerr << "[Puck] Config loaded: coarse=" << conf.coarse_cluster_count
                   << " fine=" << conf.fine_cluster_count
                   << " filter_nsq=" << conf.filter_nsq
-                  << " nsq=" << conf.nsq
-                  << " whether_filter=" << conf.whether_filter
-                  << " whether_pq=" << conf.whether_pq;
+                  << " nsq=" << conf.nsq << std::endl;
 
-        // IMPORTANT: set all gflags *before* creating/initializing the PuckIndex
-        google::SetCommandLineOption("index_path", tempDir.c_str());
-        google::SetCommandLineOption("feature_dim", std::to_string(dimension).c_str());
-        google::SetCommandLineOption("total_point_count", std::to_string(numVectors).c_str());
-        google::SetCommandLineOption("coarse_cluster_count", std::to_string(conf.coarse_cluster_count).c_str());
-        google::SetCommandLineOption("fine_cluster_count", std::to_string(conf.fine_cluster_count).c_str());
-        google::SetCommandLineOption("whether_filter", (conf.whether_filter ? "true" : "false"));
-        google::SetCommandLineOption("filter_nsq", std::to_string(conf.filter_nsq).c_str());
-        google::SetCommandLineOption("whether_pq", (conf.whether_pq ? "true" : "false"));
-        google::SetCommandLineOption("nsq", std::to_string(conf.nsq).c_str());
-        google::SetCommandLineOption("ks", std::to_string(conf.ks).c_str());
-        google::SetCommandLineOption("context_initial_pool_size", "16");
-        // Also set file names flags if needed (optional, if consistent with build)
-        // e.g. coarse_codebook_file_name, etc.
-
-        // Sanity-check: ensure that index_path gflag was set correctly
-        std::string verifyIndexPath;
-        google::GetCommandLineOption("index_path", &verifyIndexPath);
-        if (verifyIndexPath != tempDir) {
-            throw std::runtime_error("gflag index_path mismatch: set " + tempDir + " got " + verifyIndexPath);
-        }
-
-        // Instantiate PuckIndex and load into memory
-        auto index = std::make_unique<PuckIndexWrapper>();
-        index->directSetConf(conf, tempDir);
-
-   
-        // Initialize model memory
-        if (index->public_init_model_memory() != 0) {
-            throw std::runtime_error("init_model_memory failed");
-        }
-
-        // Load codebooks / quantization tables
-        if (index->public_read_coodbooks() != 0) {
-            throw std::runtime_error("read_codebooks failed");
-        }
-
-        // Set up memory indexing
-        auto coarseCount = conf.coarse_cluster_count * conf.fine_cluster_count;
-        std::unique_ptr<uint32_t[]> cellStartMemoryIdx(new uint32_t[coarseCount + 1]);
-        std::unique_ptr<uint32_t[]> localToMemoryIdx(new uint32_t[numVectors]);
-
-        // int conv = index->public_convert_local_to_memory_idx(cellStartMemoryIdx.get(), localToMemoryIdx.get());
-        // if (conv != 0) {
-        //     throw std::runtime_error("convert_local_to_memory_idx failed (code " + std::to_string(conv) + ")");
-        // }
-        // auto coarseCount = conf.coarse_cluster_count * conf.fine_cluster_count;
-        // std::unique_ptr<uint32_t[]> cell_start_memory_idx(new uint32_t[coarseCount + 1]);
-        // std::unique_ptr<uint32_t[]> local_to_memory_idx(new uint32_t[numVectors]);
-        for (uint32_t i = 0; i < numVectors; i++) {
-            localToMemoryIdx[i] = i;  // Identity mapping
-        }
-
-        // Build cell_start_memory_idx from cellAssignments
-        std::vector<uint32_t> cell_counts(coarseCount, 0);
-        for (uint32_t i = 0; i < numVectors; i++) {
-            cell_counts[cellAssignments[i]]++;
-        }
-
-        cellStartMemoryIdx[0] = 0;
-        for (uint32_t i = 0; i < coarseCount; i++) {
-            cellStartMemoryIdx[i + 1] = cellStartMemoryIdx[i] + cell_counts[i];
-        }
         
-        // Load quantization features (PQ / filter data)
-        if (index->public_read_feature_index(localToMemoryIdx.get()) != 0) {
-            throw std::runtime_error("read_feature_index failed");
-        }
+        index->init();
 
-        // This creates a pool of SearchContext objects needed for concurrent searches
+        
+        std::cerr << "[Puck] PuckIndex initialized" << std::endl;
 
-        index->public_init_context_pool();
-
-        // Wrap into metadata to return to Java
+        // Create metadata
         IndexMetadata *meta = new IndexMetadata();
         meta->ids = std::move(ids);
         meta->vectors = std::move(vectors);
         meta->cellAssignments = std::move(cellAssignments);
-        meta->puckIndex = std::move(index);
+        meta->puckIndex.reset(index);
         meta->indexConf = conf;
         meta->dimension = dimension;
         meta->numVectors = numVectors;
         meta->tempDir = tempDir;
 
-        LOG(INFO) << "[Puck] LoadIndex succeeded, returning native pointer";
+        std::cerr << "[Puck] LoadIndex SUCCEEDED, returning pointer" << std::endl;
         return reinterpret_cast<jlong>(meta);
 
     } catch (const std::exception &e) {
-        // Clean up tempDir if created
-        if (!tempDir.empty()) {
-            ::system(("rm -rf " + tempDir).c_str());
-        }
-        std::string msg = std::string("LoadIndex failed: ") + e.what();
-        jniUtil->ThrowJavaException(env, "java/lang/Exception", msg.c_str());
+        std::cerr << "[Puck] LoadIndex FAILED: " << e.what() << std::endl;
+        jniUtil->ThrowJavaException(env, "java/lang/Exception", e.what());
         return 0;
     }
 }
 
+
+
+// jobjectArray QueryIndex(
+//     knn_jni::JNIUtilInterface* jniUtil,
+//     JNIEnv* env,
+//     jlong indexPointerJ,
+//     jfloatArray queryVectorJ,
+//     jint kJ,
+//     jobject methodParamsJ,
+//     jintArray parentIdsJ
+// ) {
+//     std::cerr << "[Puck-JNI] ===== QueryIndex START =====" << std::endl;
+//     std::cerr << "[Puck-JNI] indexPointer=" << indexPointerJ << " k=" << kJ << std::endl;
+    
+//     try {
+//         // 1. Get metadata
+//         auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointerJ);
+//         if (!metadata) {
+//             std::cerr << "[Puck-JNI] ERROR: metadata is NULL" << std::endl;
+//             throw std::runtime_error("Invalid metadata pointer");
+//         }
+        
+//         if (!metadata->puckIndex) {
+//             std::cerr << "[Puck-JNI] ERROR: puckIndex is NULL" << std::endl;
+//             throw std::runtime_error("Invalid puckIndex pointer");
+//         }
+
+                
+//         std::cerr << "[Puck-JNI] Index has " << metadata->ids.size() << " documents" << std::endl;
+//         std::cerr << "[Puck-JNI] Segment info:" << std::endl;
+//         std::cerr << "  - Document count: " << metadata->ids.size() << std::endl;
+//         std::cerr << "  - Dimension: " << metadata->dimension << std::endl;
+//         std::cerr << "  - Temp dir: " << metadata->tempDir << std::endl;
+//         std::cerr << "  - First doc ID: " << (metadata->ids.empty() ? -1 : metadata->ids[0]) << std::endl;
+//         std::cerr << "  - Last doc ID: " << (metadata->ids.empty() ? -1 : metadata->ids.back()) << std::endl;
+//         std::cerr << "[Puck-JNI] PuckIndex pointer: " << metadata->puckIndex.get() << std::endl;
+        
+//         // 2. Extract query vector
+//         float* queryArray = jniUtil->GetFloatArrayElements(env, queryVectorJ, nullptr);
+//         jsize dimension = jniUtil->GetJavaFloatArrayLength(env, queryVectorJ);
+        
+//         std::cerr << "[Puck-JNI] Query dimension: " << dimension << std::endl;
+//         std::cerr << "[Puck-JNI] Query vector: [";
+//         for (int i = 0; i < std::min(5, (int)dimension); i++) {
+//             std::cerr << queryArray[i] << " ";
+//         }
+//         std::cerr << "...]" << std::endl;
+        
+//         // 4. Prepare request
+//         puck::Request request;
+//         request.topk = static_cast<uint32_t>(kJ);
+//         request.feature = queryArray;
+        
+//         std::cerr << "[Puck-JNI] Request prepared, topk=" << request.topk << std::endl;
+        
+//         // 5. Prepare response
+//         std::vector<float> distances(kJ);
+//         std::vector<uint32_t> localIndices(kJ);
+        
+//         puck::Response response;
+//         response.distance = distances.data();
+//         response.local_idx = localIndices.data();
+//         response.result_num = 0;
+        
+//         // 6. Execute search
+//         std::cerr << "[Puck-JNI] Calling PuckIndex::search()..." << std::endl;
+//         int ret = metadata->puckIndex->search(&request, &response);
+        
+//         std::cerr << "[Puck-JNI] Search returned: " << ret << std::endl;
+//         std::cerr << "[Puck-JNI] Result count: " << response.result_num << std::endl;
+        
+//         if (ret != 0) {
+//             std::cerr << "[Puck-JNI] ERROR: Search failed with code " << ret << std::endl;
+//             throw std::runtime_error("PuckIndex::search failed: " + std::to_string(ret));
+//         }
+        
+//         // 7. Create result array
+//         int resultSize = std::min(kJ, static_cast<int>(response.result_num));
+//         std::cerr << "[Puck-JNI] Creating result array, size=" << resultSize << std::endl;
+        
+//         jclass resultClass = jniUtil->FindClass(env, "org/opensearch/knn/index/query/KNNQueryResult");
+//         jmethodID constructor = jniUtil->FindMethod(env, "org/opensearch/knn/index/query/KNNQueryResult", "<init>");
+        
+//         jobjectArray results = jniUtil->NewObjectArray(env, resultSize, resultClass, nullptr);
+        
+//         // 8. Fill results
+//         for (int i = 0; i < resultSize; i++) {
+//             uint32_t localIdx = response.local_idx[i];
+            
+//             if (localIdx >= metadata->ids.size()) {
+//                 std::cerr << "[Puck-JNI] ERROR: Invalid index " << localIdx 
+//                           << " (max: " << metadata->ids.size() << ")" << std::endl;
+//                 throw std::runtime_error("Invalid local index");
+//             }
+            
+//             jlong docId = static_cast<jlong>(metadata->ids[localIdx]);
+//             jfloat distance = response.distance[i];
+            
+//             std::cerr << "[Puck-JNI]   Result[" << i << "]: localIdx=" << localIdx 
+//                       << " docId=" << docId << " dist=" << distance << std::endl;
+            
+//             jobject result = jniUtil->NewObject(env, resultClass, constructor, docId, distance);
+//             jniUtil->SetObjectArrayElement(env, results, i, result);
+//         }
+        
+//         std::cerr << "[Puck-JNI] ===== QueryIndex SUCCESS =====" << std::endl;
+//         return results;
+        
+//     } catch (const std::exception& e) {
+//         std::cerr << "[Puck-JNI] ===== QueryIndex ERROR: " << e.what() << " =====" << std::endl;
+//         jniUtil->ThrowJavaException(env, "java/lang/RuntimeException", e.what());
+//         return nullptr;
+//     }
+// }
+
+// optimized version for qeuerying
+// Rename the JNI method to indicate it returns raw arrays
 jobjectArray QueryIndex(
     knn_jni::JNIUtilInterface* jniUtil,
     JNIEnv* env,
@@ -805,99 +801,83 @@ jobjectArray QueryIndex(
     jintArray parentIdsJ
 ) {
     try {
-        LOG(INFO) << "[Puck-JNI] QueryIndex START, k=" << kJ;
-        
-        // 1. Get metadata (NOT PuckIndex directly!)
+        // 1. Validate metadata
         auto* metadata = reinterpret_cast<IndexMetadata*>(indexPointerJ);
         if (!metadata || !metadata->puckIndex) {
-            throw std::runtime_error("Invalid metadata pointer");
+            throw std::runtime_error("Invalid metadata or puckIndex pointer");
         }
         
-        LOG(INFO) << "[Puck-JNI] Index has " << metadata->ids.size() << " documents";
-        
-        // 2. Extract and normalize query vector
-        float* queryArray = jniUtil->GetFloatArrayElements(env, queryVectorJ, nullptr);
-        jsize dimension = jniUtil->GetJavaFloatArrayLength(env, queryVectorJ);
-        
-        std::vector<float> normalizedQuery(dimension);
-        float norm = 0.0f;
-        for (int i = 0; i < dimension; i++) {
-            norm += queryArray[i] * queryArray[i];
-        }
-        norm = std::sqrt(norm);
-        
-        if (norm > 1e-6) {
-            for (int i = 0; i < dimension; i++) {
-                normalizedQuery[i] = queryArray[i] / norm;
-            }
-            LOG(INFO) << "[Puck-JNI] Query normalized, norm=" << norm;
-        } else {
-            std::copy(queryArray, queryArray + dimension, normalizedQuery.begin());
+        // 2. Get query vector using GetPrimitiveArrayCritical (fastest)
+        float* queryArray = static_cast<float*>(
+            jniUtil->GetPrimitiveArrayCritical(env, queryVectorJ, nullptr)
+        );
+        if (!queryArray) {
+            throw std::runtime_error("Failed to get query vector");
         }
         
-        jniUtil->ReleaseFloatArrayElements(env, queryVectorJ, queryArray, JNI_ABORT);
-        
-        // 3. Prepare PUCK request/response
+        // 3. Prepare request (no JNI calls in critical section)
         puck::Request request;
         request.topk = static_cast<uint32_t>(kJ);
-        request.feature = normalizedQuery.data();
+        request.feature = queryArray;
         
+        // 4. Prepare response buffers
         std::vector<float> distances(kJ);
         std::vector<uint32_t> localIndices(kJ);
-        
         puck::Response response;
         response.distance = distances.data();
         response.local_idx = localIndices.data();
         response.result_num = 0;
         
-        // 4. Execute search - Puck manages SearchContext internally via _context_pool
-        LOG(INFO) << "[Puck-JNI] Calling PuckIndex::search()";
-        int ret = metadata->puckIndex->public_search(&request, &response);
+        // 5. Execute search
+        int ret = metadata->puckIndex->search(&request, &response);
+        
+        // 6. Release query vector immediately (end critical section)
+        jniUtil->ReleasePrimitiveArrayCritical(env, queryVectorJ, queryArray, JNI_ABORT);
         
         if (ret != 0) {
             throw std::runtime_error("PuckIndex::search failed: " + std::to_string(ret));
         }
         
-        LOG(INFO) << "[Puck-JNI] Search found " << response.result_num << " results";
-        
-        // 5. Create KNNQueryResult array (FAISS pattern)
         int resultSize = std::min(kJ, static_cast<int>(response.result_num));
         
+        // 7. Get cached class and method (already cached in JNIUtil::Initialize)
         jclass resultClass = jniUtil->FindClass(env, "org/opensearch/knn/index/query/KNNQueryResult");
         jmethodID constructor = jniUtil->FindMethod(env, "org/opensearch/knn/index/query/KNNQueryResult", "<init>");
         
+        // 8. Create result array
         jobjectArray results = jniUtil->NewObjectArray(env, resultSize, resultClass, nullptr);
         
-        // 6. Fill results with document ID mapping
+        // 9. Pre-validate all indices (fail fast)
         for (int i = 0; i < resultSize; i++) {
-            uint32_t localIdx = response.local_idx[i];
-            
-            // Validate index
-            if (localIdx >= metadata->ids.size()) {
-                throw std::runtime_error("Invalid local index: " + std::to_string(localIdx));
+            if (localIndices[i] >= metadata->ids.size()) {
+                throw std::runtime_error("Invalid index: " + std::to_string(localIndices[i]) + 
+                                        " at position " + std::to_string(i));
             }
-            
-            // Map to actual document ID
-            jlong docId = static_cast<jlong>(metadata->ids[localIdx]);
-            jfloat distance = response.distance[i];
-            
-            LOG(INFO) << "[Puck-JNI] Result[" << i << "]: localIdx=" << localIdx 
-                      << ", docId=" << docId << ", dist=" << distance;
-            
-            jobject result = jniUtil->NewObject(env, resultClass, constructor, docId, distance);
-            jniUtil->SetObjectArrayElement(env, results, i, result);
         }
         
-        LOG(INFO) << "[Puck-JNI] QueryIndex SUCCESS, returned " << resultSize << " results";
+        // 10. Fill results with immediate local ref cleanup
+        for (int i = 0; i < resultSize; i++) {
+            uint32_t localIdx = localIndices[i];
+            jint docId = static_cast<jint>(metadata->ids[localIdx]);
+            jfloat distance = distances[i];
+            
+            // Create object using cached constructor
+            jobject result = jniUtil->NewObject(env, resultClass, constructor, docId, distance);
+            
+            // Set in array
+            jniUtil->SetObjectArrayElement(env, results, i, result);
+            
+            // Immediately delete local reference to reduce memory pressure
+            jniUtil->DeleteLocalRef(env, result);
+        }
+        
         return results;
         
     } catch (const std::exception& e) {
-        LOG(ERROR) << "[Puck-JNI] QueryIndex ERROR: " << e.what();
         jniUtil->ThrowJavaException(env, "java/lang/RuntimeException", e.what());
         return nullptr;
     }
 }
-
 
 
 
@@ -930,7 +910,7 @@ int knn_query_index(jlong indexPointer, jfloat* queryVector, jint dimension,
         LOG(INFO) << "Index has " << metadata->ids.size() << " documents";
         
         // Get configuration
-        puck::IndexConf& conf = metadata->puckIndex->get_index_conf();
+        puck::IndexConf& conf = metadata->indexConf;
         
         // Ensure topk is sufficient
         if (conf.topk < static_cast<uint32_t>(k)) {
